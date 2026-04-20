@@ -24,6 +24,11 @@ for required in "$source_cli" "$thirdparty_cli" "$sync_home" "$prepare_app"; do
   fi
 done
 
+if ! command -v python3 >/dev/null 2>&1; then
+  print -u2 "required command not found: python3"
+  exit 1
+fi
+
 mkdir -p "$log_dir"
 "$sync_home" thirdparty "$desktop_home"
 CODEX_HOME="$desktop_home" CODEX_FORCE_MODEL_CATALOG=1 "$thirdparty_cli" --version >"$log_file" 2>&1
@@ -34,12 +39,31 @@ defaults write com.openai.codex.thirdparty SUAutomaticallyUpdate -bool false >/d
 print "Opening Codex 3P at $target_app..."
 print "Opening workspace $workspace..."
 
-env \
-  CODEX_HOME="$desktop_home" \
-  CODEX_CLI_PATH="$thirdparty_cli" \
-  CODEX_ELECTRON_APP_NAME="Codex 3P" \
-  CODEX_ELECTRON_USER_DATA_PATH="$electron_user_data" \
-  "$target_bin" \
-  --use-mock-keychain \
-  "$workspace" \
-  >"$log_file" 2>&1 < /dev/null &!
+CODEX_HOME="$desktop_home" \
+CODEX_CLI_PATH="$thirdparty_cli" \
+CODEX_ELECTRON_APP_NAME="Codex 3P" \
+CODEX_ELECTRON_USER_DATA_PATH="$electron_user_data" \
+python3 - "$target_bin" "$log_file" "$workspace" <<'PY'
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+target_bin = Path(sys.argv[1]).expanduser()
+log_file = Path(sys.argv[2]).expanduser()
+workspace = sys.argv[3]
+
+log_file.parent.mkdir(parents=True, exist_ok=True)
+
+with log_file.open("ab", buffering=0) as log_handle, open(os.devnull, "rb") as devnull:
+    subprocess.Popen(
+        [str(target_bin), "--use-mock-keychain", workspace],
+        env=os.environ.copy(),
+        stdin=devnull,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        close_fds=True,
+    )
+PY

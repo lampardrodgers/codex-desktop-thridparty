@@ -1,5 +1,10 @@
 # Changelog
 
+## 20260420.1 - 2026-04-20
+
+- Updated `codex-app-3p` to launch Codex 3P in a detached child process so running the launcher from Terminal no longer closes the current tab.
+- Kept log redirection unchanged while applying the detached launch flow to the distributable script template.
+
 ## 20260418.7 - 2026-04-20
 
 - Initial public release of the Codex Desktop 3P wrapper package.
