@@ -1,0 +1,63 @@
+#!/bin/zsh
+set -euo pipefail
+
+workspace="${1:-$PWD}"
+source_app="/Applications/Codex.app"
+desktop_home="$HOME/.codex/app-homes/openai"
+sync_home="$HOME/.codex/bin/codex-sync-desktop-home"
+log_dir="$HOME/.codex/logs"
+log_file="$log_dir/codex-app-openai.log"
+official_proc_pattern='/Applications/Codex.app/Contents/MacOS/Codex'
+
+if [ -d "$workspace" ]; then
+  workspace="$(cd "$workspace" && pwd -P)"
+fi
+
+if [ ! -d "$workspace" ]; then
+  print -u2 "workspace directory not found: $workspace"
+  exit 1
+fi
+
+if [ ! -d "$source_app" ]; then
+  print -u2 "required app not found: $source_app"
+  exit 1
+fi
+
+if [ ! -x "$sync_home" ]; then
+  print -u2 "required executable not found: $sync_home"
+  exit 1
+fi
+
+if pgrep -f "$official_proc_pattern" >/dev/null 2>&1; then
+  print -u2 "Codex App is already running. Quit Codex first, then run: codex-app-openai [workspace]"
+  exit 1
+fi
+
+"$sync_home" openai "$desktop_home"
+mkdir -p "$log_dir"
+
+print "Opening Codex Desktop at /Applications/Codex.app..."
+print "Opening workspace $workspace..."
+
+cleanup() {
+  launchctl unsetenv CODEX_HOME >/dev/null 2>&1 || true
+}
+
+trap cleanup EXIT
+unset CODEX_HOME
+unset CODEX_CLI_PATH
+unset CODEX_ELECTRON_APP_NAME
+unset CODEX_ELECTRON_USER_DATA_PATH
+unset CODEX_FORCE_MODEL_CATALOG
+unset CODEX_INTERNAL_ORIGINATOR_OVERRIDE
+unset DISABLE_AUTO_UPDATE
+unset CODEX_SHELL
+launchctl setenv CODEX_HOME "$desktop_home"
+open -na "$source_app" "$workspace" >"$log_file" 2>&1
+
+for _ in {1..20}; do
+  if pgrep -f "$official_proc_pattern" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.25
+done

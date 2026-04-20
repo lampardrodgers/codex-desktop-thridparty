@@ -1,0 +1,84 @@
+#!/bin/zsh
+set -euo pipefail
+
+script_dir="${0:A:h}"
+templates_dir="$script_dir/templates"
+timestamp="$(date +%Y%m%d-%H%M%S)"
+source_app="/Applications/Codex.app"
+thirdparty_cli="$HOME/.local/bin/codex-3p"
+desktop_home="$HOME/.codex/app-homes/thirdparty"
+target_app="$HOME/Applications/Codex 3P.app"
+sync_home="$HOME/.codex/bin/codex-sync-desktop-home"
+prepare_app="$HOME/.codex/bin/codex-prepare-desktop-3p-app"
+log_dir="$HOME/.codex/logs"
+log_file="$log_dir/codex-app-3p.log"
+
+if [ ! -d "$templates_dir" ]; then
+  print -u2 "missing templates directory: $templates_dir"
+  exit 1
+fi
+
+if [ ! -d "$source_app" ]; then
+  print -u2 "official Codex app not found at $source_app"
+  exit 1
+fi
+
+for cmd in python3 node npx codesign; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    print -u2 "required command not found: $cmd"
+    exit 1
+  fi
+done
+
+mkdir -p "$HOME/.codex/bin" "$HOME/.local/bin"
+
+install_script() {
+  local src="$1"
+  local dest="$2"
+
+  if [ ! -f "$src" ]; then
+    print -u2 "missing template: $src"
+    exit 1
+  fi
+
+  if [ -e "$dest" ] && ! cmp -s "$src" "$dest"; then
+    cp -f "$dest" "$dest.bak.$timestamp"
+  fi
+
+  cp -f "$src" "$dest"
+  chmod 700 "$dest"
+  print "installed $dest"
+}
+
+for name in codex-sync-desktop-home codex-prepare-desktop-3p-app codex-thirdparty-token codex-configure-desktop-defaults; do
+  install_script "$templates_dir/$name" "$HOME/.codex/bin/$name"
+done
+
+for name in codex-3p codex-app-openai codex-app-3p codex-app-3p-check; do
+  install_script "$templates_dir/$name" "$HOME/.local/bin/$name"
+done
+
+"$HOME/.codex/bin/codex-configure-desktop-defaults"
+
+if [ ! -x "$thirdparty_cli" ]; then
+  print -u2 "required executable not found: $thirdparty_cli"
+  exit 1
+fi
+
+mkdir -p "$log_dir"
+"$sync_home" thirdparty "$desktop_home"
+CODEX_HOME="$desktop_home" CODEX_FORCE_MODEL_CATALOG=1 "$thirdparty_cli" --version >"$log_file" 2>&1
+"$prepare_app" "$source_app" "$target_app" >/dev/null
+defaults write com.openai.codex.thirdparty SUEnableAutomaticChecks -bool false >/dev/null 2>&1 || true
+defaults write com.openai.codex.thirdparty SUAutomaticallyUpdate -bool false >/dev/null 2>&1 || true
+
+print ""
+print "Desktop 3P helpers installed."
+print "Managed 3P CLI:         $HOME/.local/bin/codex-3p"
+print "OpenAI app launcher:    $HOME/.local/bin/codex-app-openai"
+print "Third-party launcher:   $HOME/.local/bin/codex-app-3p"
+print "Health check:           $HOME/.local/bin/codex-app-3p-check"
+print "Prepared desktop app:   $target_app"
+print "Third-party log file:   $log_file"
+print ""
+print "Run codex-app-3p-check to verify the current setup."

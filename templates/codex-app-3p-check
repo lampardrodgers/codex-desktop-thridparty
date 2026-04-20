@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+
+import json
+import os
+import plistlib
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+
+
+HOME = Path.home()
+BASE_CODEX_HOME = HOME / ".codex"
+OFFICIAL_APP = Path("/Applications/Codex.app")
+CLONED_APP = HOME / "Applications" / "Codex 3P.app"
+EXPECTED_LS_ENV = {
+    "CODEX_HOME": str(HOME / ".codex" / "app-homes" / "thirdparty"),
+    "CODEX_CLI_PATH": str(HOME / ".local" / "bin" / "codex-3p"),
+    "CODEX_ELECTRON_APP_NAME": "Codex 3P",
+    "CODEX_ELECTRON_USER_DATA_PATH": str(HOME / ".codex" / "electron-user-data-thirdparty"),
+    "CODEX_FORCE_MODEL_CATALOG": "1",
+}
+SCRIPT_CHECKS = [
+    (HOME / ".codex" / "bin" / "codex-sync-desktop-home", "sync helper"),
+    (HOME / ".codex" / "bin" / "codex-prepare-desktop-3p-app", "clone helper"),
+    (HOME / ".codex" / "bin" / "codex-thirdparty-token", "token helper"),
+    (HOME / ".codex" / "bin" / "codex-configure-desktop-defaults", "desktop default helper"),
+    (HOME / ".local" / "bin" / "codex-3p", "managed 3P CLI"),
+    (HOME / ".local" / "bin" / "codex-app-openai", "OpenAI launcher"),
+    (HOME / ".local" / "bin" / "codex-app-3p", "3P launcher"),
+    (HOME / ".local" / "bin" / "codex-app-3p-check", "check launcher"),
+]
+CODEX_CLI = OFFICIAL_APP / "Contents" / "Resources" / "codex"
+
+
+class Reporter:
+    def __init__(self) -> None:
+        self.failures = 0
+        self.warnings = 0
+
+    def ok(self, message: str) -> None:
+        print(f"[OK]   {message}")
+
+    def warn(self, message: str) -> None:
+        self.warnings += 1
+        print(f"[WARN] {message}")
+
+    def fail(self, message: str) -> None:
+        self.failures += 1
+        print(f"[FAIL] {message}")
+
+
+def load_toml(path: Path) -> dict:
+    return tomllib.loads(path.read_text(encoding="utf-8"))
+
+
+def top_level_provider(path: Path) -> str | None:
+    data = load_toml(path)
+    value = data.get("model_provider")
+    return value if isinstance(value, str) else None
+
+
+def top_level_string(path: Path, key: str) -> str | None:
+    data = load_toml(path)
+    value = data.get(key)
+    return value if isinstance(value, str) else None
+
+
+def provider_base_url() -> str | None:
+    config_paths = [
+        BASE_CODEX_HOME / "app-homes" / "thirdparty" / "config.toml",
+        BASE_CODEX_HOME / "config.toml",
+    ]
+    for path in config_paths:
+        if not path.exists():
+            continue
+        data = load_toml(path)
+        provider = data.get("model_providers", {}).get("thirdparty")
+        if isinstance(provider, dict):
+            base_url = provider.get("base_url")
+            if isinstance(base_url, str) and base_url.strip():
+                return base_url.rstrip("/")
+    return None
+
+
+def masked_token(token: str) -> str:
+    if len(token) <= 8:
+        return "*" * len(token)
+    return f"{token[:4]}...{token[-4:]}"
+
+
+def run_token_helper(path: Path) -> str | None:
+    result = subprocess.run(
+        [str(path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ.copy(),
+    )
+    if result.returncode != 0:
+        return None
+    token = result.stdout.strip()
+    return token or None
+
+
+def check_codesign(app_path: Path) -> bool:
+    result = subprocess.run(
+        ["codesign", "--verify", "--deep", "--strict", str(app_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+def request_models(base_url: str, token: str) -> list[str]:
+    request = urllib.request.Request(
+        f"{base_url}/models",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "codex-app-3p-check",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    items = payload.get("data") or payload.get("models") or []
+    model_ids: list[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            value = item.get("id") or item.get("slug")
+        else:
+            value = str(item)
+        if isinstance(value, str) and value and value not in model_ids:
+            model_ids.append(value)
+    return model_ids
+
+
+def model_catalog_entries(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    items = data.get("models")
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def runtime_model_ids(codex_home: Path, extra_env: dict[str, str] | None = None) -> list[str]:
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(codex_home)
+    if extra_env:
+        env.update(extra_env)
+
+    server = subprocess.Popen(
+        [str(CODEX_CLI), "app-server", "--listen", "ws://127.0.0.1:8896"],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        time.sleep(1.2)
+        script = """
+const ws = new WebSocket('ws://127.0.0.1:8896');
+ws.onopen = () => ws.send(JSON.stringify({jsonrpc:'2.0',id:'init',method:'initialize',params:{protocolVersion:'2025-06-18',clientInfo:{name:'check',version:'0'},capabilities:{}}}));
+ws.onmessage = (event) => {
+  const msg = JSON.parse(String(event.data));
+  if (msg.id === 'init') {
+    ws.send(JSON.stringify({jsonrpc:'2.0',method:'notifications/initialized',params:{}}));
+    ws.send(JSON.stringify({jsonrpc:'2.0',id:'models',method:'model/list',params:{}}));
+    return;
+  }
+  if (msg.id === 'models') {
+    const items = (msg.result?.data || []).filter((m) => !m.hidden).map((m) => m.id).filter(Boolean);
+    console.log(JSON.stringify(items));
+    process.exit(0);
+  }
+};
+ws.onerror = (err) => { console.error(err.message || err); process.exit(1); };
+setTimeout(() => process.exit(2), 10000);
+"""
+        result = subprocess.run(
+            ["node", "-e", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "model/list failed")
+        return json.loads(result.stdout.strip())
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            server.kill()
+
+
+def main() -> int:
+    reporter = Reporter()
+
+    if OFFICIAL_APP.exists():
+        reporter.ok(f"official app found: {OFFICIAL_APP}")
+    else:
+        reporter.fail(f"official app missing: {OFFICIAL_APP}")
+
+    for path, label in SCRIPT_CHECKS:
+        if path.exists() and os.access(path, os.X_OK):
+            reporter.ok(f"{label} ready: {path}")
+        else:
+            reporter.fail(f"{label} missing or not executable: {path}")
+
+    if CLONED_APP.exists():
+        info_plist = CLONED_APP / "Contents" / "Info.plist"
+        if not info_plist.exists():
+            reporter.fail(f"cloned app missing Info.plist: {info_plist}")
+        else:
+            with info_plist.open("rb") as handle:
+                info = plistlib.load(handle)
+            bundle_id = info.get("CFBundleIdentifier")
+            display_name = info.get("CFBundleDisplayName")
+            if bundle_id == "com.openai.codex.thirdparty" and display_name == "Codex 3P":
+                reporter.ok("cloned app identity is correct")
+            else:
+                reporter.fail(
+                    "cloned app identity mismatch: "
+                    f"bundle_id={bundle_id!r} display_name={display_name!r}"
+                )
+            ls_environment = info.get("LSEnvironment")
+            if isinstance(ls_environment, dict):
+                missing_env = [
+                    f"{key}={value}"
+                    for key, value in EXPECTED_LS_ENV.items()
+                    if ls_environment.get(key) != value
+                ]
+                if missing_env:
+                    reporter.fail(
+                        "cloned app LSEnvironment mismatch: " + ", ".join(missing_env)
+                    )
+                else:
+                    reporter.ok("cloned app LSEnvironment pins thirdparty defaults")
+            else:
+                reporter.fail("cloned app LSEnvironment missing")
+
+        if check_codesign(CLONED_APP):
+            reporter.ok(f"cloned app signature valid: {CLONED_APP}")
+        else:
+            reporter.fail(f"cloned app signature invalid: {CLONED_APP}")
+    else:
+        reporter.warn(
+            f"cloned app not created yet: {CLONED_APP} (run codex-app-3p once to build it)"
+        )
+
+    openai_config = BASE_CODEX_HOME / "app-homes" / "openai" / "config.toml"
+    openai_catalog = BASE_CODEX_HOME / "app-homes" / "openai" / "model-catalogs" / "openai.json"
+    if openai_config.exists():
+        provider = top_level_provider(openai_config)
+        if provider == "openai":
+            reporter.ok("openai app-home provider is openai")
+        else:
+            reporter.fail(f"openai app-home provider is {provider!r}, expected 'openai'")
+
+        configured_catalog = top_level_string(openai_config, "model_catalog_json")
+        if configured_catalog is None:
+            reporter.ok("openai app-home does not override the official model catalog")
+        else:
+            reporter.fail(
+                "openai app-home should not pin model_catalog_json, found: "
+                f"{configured_catalog!r}"
+            )
+    else:
+        reporter.warn(f"openai app-home config missing: {openai_config}")
+
+    openai_catalog_slugs: list[str] = []
+    if openai_catalog.exists():
+        openai_catalog_entries = model_catalog_entries(openai_catalog)
+        openai_catalog_slugs = [
+            str(entry.get("slug"))
+            for entry in openai_catalog_entries
+            if isinstance(entry.get("slug"), str)
+        ]
+        if openai_catalog_slugs:
+            reporter.ok(
+                "openai app-home catalog is populated: "
+                + ", ".join(openai_catalog_slugs)
+            )
+        else:
+            reporter.fail(f"openai app-home catalog is empty: {openai_catalog}")
+
+        if "gpt-5.3-codex-spark" in openai_catalog_slugs:
+            reporter.fail("openai app-home catalog should not include gpt-5.3-codex-spark")
+    else:
+        reporter.warn(f"openai app-home catalog missing: {openai_catalog}")
+
+    thirdparty_config = BASE_CODEX_HOME / "app-homes" / "thirdparty" / "config.toml"
+    if thirdparty_config.exists():
+        provider = top_level_provider(thirdparty_config)
+        if provider == "thirdparty":
+            reporter.ok("thirdparty app-home provider is thirdparty")
+        else:
+            reporter.fail(
+                f"thirdparty app-home provider is {provider!r}, expected 'thirdparty'"
+            )
+        config_text = thirdparty_config.read_text(encoding="utf-8")
+        if "service_tier" in config_text:
+            reporter.fail("thirdparty app-home still forces service_tier")
+        else:
+            reporter.ok("thirdparty app-home does not force service_tier")
+    else:
+        reporter.warn(f"thirdparty app-home config missing: {thirdparty_config}")
+
+    thirdparty_catalog = BASE_CODEX_HOME / "app-homes" / "thirdparty" / "model-catalogs" / "thirdparty.json"
+    if thirdparty_catalog.exists():
+        catalog_entries = model_catalog_entries(thirdparty_catalog)
+        spark_entry = next(
+            (entry for entry in catalog_entries if entry.get("slug") == "gpt-5.3-codex-spark"),
+            None,
+        )
+        if spark_entry is None:
+            reporter.fail("thirdparty catalog is missing gpt-5.3-codex-spark")
+        else:
+            reporter.ok("thirdparty catalog contains gpt-5.3-codex-spark")
+
+        forced_fast_models = [
+            str(entry.get("slug"))
+            for entry in catalog_entries
+            if isinstance(entry.get("additional_speed_tiers"), list)
+            and "fast" in entry["additional_speed_tiers"]
+        ]
+        if forced_fast_models:
+            reporter.ok(
+                "thirdparty catalog keeps fast tiers for: "
+                + ", ".join(forced_fast_models)
+            )
+        else:
+            reporter.ok("thirdparty catalog is ready for runtime model sync")
+
+        if any(entry.get("slug") == "gpt-5.4-mini" for entry in catalog_entries):
+            reporter.ok("thirdparty catalog contains gpt-5.4-mini")
+        else:
+            reporter.fail("thirdparty catalog is missing gpt-5.4-mini")
+    else:
+        reporter.warn(f"thirdparty catalog missing: {thirdparty_catalog}")
+
+    token_path = HOME / ".codex" / "bin" / "codex-thirdparty-token"
+    token = run_token_helper(token_path) if token_path.exists() else None
+    if token:
+        reporter.ok(f"thirdparty token resolved: {masked_token(token)}")
+    else:
+        reporter.fail("thirdparty token could not be resolved")
+
+    base_url = provider_base_url()
+    if base_url:
+        reporter.ok(f"thirdparty base_url detected: {base_url}")
+    else:
+        reporter.fail("thirdparty base_url missing from config")
+
+    if token and base_url:
+        try:
+            model_ids = request_models(base_url, token)
+        except Exception as exc:
+            reporter.fail(f"provider /models request failed: {exc}")
+        else:
+            if model_ids:
+                reporter.ok(f"provider /models ok: {len(model_ids)} models")
+            else:
+                reporter.warn("provider /models succeeded but returned no models")
+
+    if CODEX_CLI.exists():
+        try:
+            openai_runtime_models = runtime_model_ids(BASE_CODEX_HOME / "app-homes" / "openai")
+        except Exception as exc:
+            reporter.fail(f"openai runtime model/list failed: {exc}")
+        else:
+            if openai_runtime_models:
+                reporter.ok(
+                    "openai runtime model/list is available: "
+                    + ", ".join(openai_runtime_models)
+                )
+                if openai_catalog_slugs:
+                    missing_catalog_models = [
+                        model_id
+                        for model_id in openai_runtime_models
+                        if model_id not in openai_catalog_slugs
+                    ]
+                    extra_catalog_models = [
+                        model_id
+                        for model_id in openai_catalog_slugs
+                        if model_id not in openai_runtime_models
+                    ]
+                    if not missing_catalog_models and not extra_catalog_models:
+                        reporter.ok("openai app-home catalog matches official runtime")
+                    else:
+                        reporter.fail(
+                            "openai app-home catalog mismatch: "
+                            f"missing={missing_catalog_models or ['<none>']} "
+                            f"extra={extra_catalog_models or ['<none>']}"
+                        )
+            else:
+                reporter.fail("openai runtime model/list is empty")
+
+        try:
+            thirdparty_runtime_models = runtime_model_ids(
+                BASE_CODEX_HOME / "app-homes" / "thirdparty",
+                {"CODEX_CLI_PATH": str(HOME / ".local" / "bin" / "codex-3p")},
+            )
+        except Exception as exc:
+            reporter.fail(f"thirdparty runtime model/list failed: {exc}")
+        else:
+            expected_thirdparty_models = [
+                "gpt-5.4",
+                "gpt-5.4-mini",
+                "gpt-5.3-codex",
+                "gpt-5.3-codex-spark",
+                "gpt-5.2",
+            ]
+            if thirdparty_runtime_models == expected_thirdparty_models:
+                reporter.ok("thirdparty runtime model/list includes gpt-5.4-mini and spark")
+            else:
+                reporter.fail(
+                    "thirdparty runtime model/list mismatch: "
+                    + ", ".join(thirdparty_runtime_models or ["<empty>"])
+                )
+
+    global_config = BASE_CODEX_HOME / "config.toml"
+    if global_config.exists():
+        provider = top_level_provider(global_config)
+        if provider == "openai":
+            reporter.ok("global config provider is openai")
+        elif provider:
+            reporter.fail(
+                f"global config provider is {provider!r}, expected 'openai' "
+                "so the official app opens in official mode"
+            )
+        else:
+            reporter.warn("global config has no top-level model_provider")
+
+        configured_global_catalog = top_level_string(global_config, "model_catalog_json")
+        if configured_global_catalog is None:
+            reporter.ok("global config does not override the official model catalog")
+        else:
+            reporter.fail(
+                "global config should not pin model_catalog_json, found: "
+                f"{configured_global_catalog!r}"
+            )
+    else:
+        reporter.warn(f"global config missing: {global_config}")
+
+    print("")
+    if reporter.failures:
+        print(f"Check finished with {reporter.failures} failure(s) and {reporter.warnings} warning(s).")
+        return 1
+
+    print(f"Check finished with 0 failures and {reporter.warnings} warning(s).")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

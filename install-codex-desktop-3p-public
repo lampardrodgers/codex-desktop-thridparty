@@ -1,0 +1,91 @@
+#!/bin/zsh
+set -euo pipefail
+
+# Fill these two values before sharing/running this installer.
+THIRDPARTY_BASE_URL="YOUR-THIRDPARTY-BASE-URL"
+THIRDPARTY_API_KEY="YOUR-THIRDPARTY-API-KEY"
+
+script_dir="${0:A:h}"
+base_installer="$script_dir/install-codex-desktop-3p"
+codex_home="$HOME/.codex"
+config_path="$codex_home/config.toml"
+env_path="$codex_home/thirdparty.env"
+
+if [ "$THIRDPARTY_BASE_URL" = "YOUR-THIRDPARTY-BASE-URL" ] || [ "$THIRDPARTY_API_KEY" = "YOUR-THIRDPARTY-API-KEY" ]; then
+  print -u2 "Please edit the top of this script first:"
+  print -u2 "  THIRDPARTY_BASE_URL"
+  print -u2 "  THIRDPARTY_API_KEY"
+  exit 1
+fi
+
+if [ ! -x "$base_installer" ]; then
+  print -u2 "missing base installer: $base_installer"
+  exit 1
+fi
+
+if [ ! -d "/Applications/Codex.app" ]; then
+  print -u2 "official Codex app not found at /Applications/Codex.app"
+  exit 1
+fi
+
+if [ ! -f "$config_path" ]; then
+  print -u2 "missing $config_path"
+  print -u2 "Launch the official Codex app once before running this installer."
+  exit 1
+fi
+
+for cmd in python3; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    print -u2 "required command not found: $cmd"
+    exit 1
+  fi
+done
+
+mkdir -p "$codex_home"
+chmod 700 "$codex_home"
+
+CONFIG_PATH="$config_path" THIRDPARTY_BASE_URL="$THIRDPARTY_BASE_URL" python3 <<'PY'
+import json
+import os
+import re
+from pathlib import Path
+
+
+config_path = Path(os.environ["CONFIG_PATH"]).expanduser()
+base_url = os.environ["THIRDPARTY_BASE_URL"].strip()
+if not base_url:
+    raise SystemExit("THIRDPARTY_BASE_URL is empty")
+
+block = "\n".join(
+    [
+        "[model_providers.thirdparty]",
+        'name = "thirdparty"',
+        f"base_url = {json.dumps(base_url)}",
+        'wire_api = "responses"',
+        'env_key = "CODEX_THIRDPARTY_API_KEY"',
+    ]
+)
+
+text = config_path.read_text(encoding="utf-8")
+pattern = r"(?ms)^\[model_providers\.thirdparty\]\n.*?(?=^\[|\Z)"
+replacement = block + "\n"
+
+if re.search(pattern, text):
+    text = re.sub(pattern, replacement, text)
+else:
+    if text and not text.endswith("\n"):
+        text += "\n"
+    if text and not text.endswith("\n\n"):
+        text += "\n"
+    text += replacement
+
+config_path.write_text(text, encoding="utf-8")
+PY
+
+cat > "$env_path" <<EOF
+# Third-party desktop credentials for codex-app-3p / codex-3p
+CODEX_THIRDPARTY_API_KEY=$THIRDPARTY_API_KEY
+EOF
+chmod 600 "$env_path"
+
+exec "$base_installer"

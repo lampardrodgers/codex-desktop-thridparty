@@ -1,0 +1,541 @@
+#!/usr/bin/env python3
+
+import copy
+import json
+import os
+import re
+import socket
+import shutil
+import subprocess
+import sys
+import time
+import tomllib
+import urllib.request
+from pathlib import Path
+
+
+BASE_CODEX_HOME = Path.home() / ".codex"
+SOURCE_CONFIG_PATH = BASE_CODEX_HOME / "config.toml"
+BASE_MODEL_CATALOG_PATH = BASE_CODEX_HOME / "model-catalogs" / "thirdparty.json"
+OPENAI_CACHE_CATALOG_PATH = BASE_CODEX_HOME / "model-catalogs" / "openai-models-cache.json"
+ALL_MODELS_CATALOG_PATH = BASE_CODEX_HOME / "all-models-catalog.json"
+MODELS_CACHE_PATH = BASE_CODEX_HOME / "models_cache.json"
+OFFICIAL_CODEX_CLI = Path("/Applications/Codex.app/Contents/Resources/codex")
+SHARED_ENTRIES = [
+    "archived_sessions",
+    "automations",
+    "bin",
+    "cache",
+    "history.jsonl",
+    "installation_id",
+    "plugins",
+    "rules",
+    "sessions",
+    "skills",
+    "themes",
+    "vendor_imports",
+    "version.json",
+    ".codex-global-state.json",
+    ".tmp",
+]
+THIRDPARTY_ENV_NAME = "thirdparty.env"
+API_KEY_ENV = "CODEX_THIRDPARTY_API_KEY"
+EXCLUDED_MODEL_SLUGS = {"codex-auto-review"}
+EXCLUDED_OPENAI_MODEL_SLUGS = {"codex-auto-review", "gpt-5.3-codex-spark"}
+
+
+def remove_project_section(text: str, project_path: str) -> str:
+    header = f"[projects.{json.dumps(project_path, ensure_ascii=False)}]"
+    pattern = rf"(?ms)^{re.escape(header)}\n.*?(?=^\[|\Z)"
+    return re.sub(pattern, "", text)
+
+
+def remove_named_section(text: str, section_name: str) -> str:
+    header = f"[{section_name}]"
+    pattern = rf"(?ms)^{re.escape(header)}\n.*?(?=^\[|\Z)"
+    return re.sub(pattern, "", text)
+
+
+def prune_missing_projects(text: str) -> str:
+    config = tomllib.loads(text)
+    projects = config.get("projects", {})
+    for project_path in sorted(projects, key=len, reverse=True):
+        if Path(project_path).exists():
+            continue
+        text = remove_project_section(text, project_path)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip() + "\n"
+    return text
+
+
+def upsert_top_level_value(text: str, key: str, value: str | None) -> str:
+    first_section = re.search(r"(?m)^\[", text)
+    if first_section:
+        top_level = text[: first_section.start()]
+        remainder = text[first_section.start() :]
+    else:
+        top_level = text
+        remainder = ""
+
+    pattern = rf"(?m)^{re.escape(key)}\s*=.*\n?"
+    if value is None:
+        top_level = re.sub(pattern, "", top_level)
+        return top_level + remainder
+
+    line = f'{key} = "{value}"\n'
+    if re.search(pattern, top_level):
+        top_level = re.sub(pattern, line, top_level, count=1)
+    else:
+        top_level = line + top_level
+    return top_level + remainder
+
+
+def upsert_profile_catalog(text: str, catalog_path: str) -> str:
+    pattern = r'(?ms)^(\[profiles\.thirdparty\]\n)(.*?)(?=^\[|\Z)'
+    match = re.search(pattern, text)
+    if not match:
+        return text
+
+    body = match.group(2)
+    catalog_line = f'model_catalog_json = "{catalog_path}"\n'
+    if re.search(r"(?m)^model_catalog_json\s*=.*\n?", body):
+        body = re.sub(r"(?m)^model_catalog_json\s*=.*\n?", catalog_line, body, count=1)
+    else:
+        body += catalog_line
+    return text[: match.start()] + match.group(1) + body + text[match.end() :]
+
+
+def load_json(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise RuntimeError(f"invalid JSON object in {path}")
+    return data
+
+
+def load_dotenv(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.exists():
+        return values
+
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        values[key.strip()] = value.strip().strip("\"'")
+    return values
+
+
+def provider_config() -> dict:
+    if not SOURCE_CONFIG_PATH.exists():
+        raise RuntimeError(f"missing source config: {SOURCE_CONFIG_PATH}")
+
+    config = tomllib.loads(SOURCE_CONFIG_PATH.read_text(encoding="utf-8"))
+    providers = config.get("model_providers", {})
+    provider = providers.get("thirdparty")
+    if not isinstance(provider, dict):
+        raise RuntimeError("missing [model_providers.thirdparty] in source config")
+    return provider
+
+
+def ensure_api_key() -> str | None:
+    api_key = os.environ.get(API_KEY_ENV)
+    if api_key:
+        return api_key
+
+    return load_dotenv(BASE_CODEX_HOME / THIRDPARTY_ENV_NAME).get(API_KEY_ENV)
+
+
+def fetch_provider_model_ids() -> list[str]:
+    provider = provider_config()
+    base_url = provider.get("base_url")
+    if not isinstance(base_url, str) or not base_url.strip():
+        return []
+
+    api_key = ensure_api_key()
+    if not api_key:
+        return []
+
+    request = urllib.request.Request(
+        base_url.rstrip("/") + "/models",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "codex-3p-launcher",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    items = payload.get("data") or payload.get("models") or []
+    ids: list[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            model_id = item.get("id") or item.get("slug")
+        else:
+            model_id = str(item)
+        if isinstance(model_id, str) and model_id and model_id not in ids:
+            ids.append(model_id)
+    return ids
+
+
+def pick_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as handle:
+        handle.bind(("127.0.0.1", 0))
+        return int(handle.getsockname()[1])
+
+
+def fetch_openai_runtime_model_ids(target_home: Path) -> list[str]:
+    if not OFFICIAL_CODEX_CLI.exists():
+        return []
+
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(target_home)
+    for key in (
+        "CODEX_CLI_PATH",
+        "CODEX_ELECTRON_APP_NAME",
+        "CODEX_ELECTRON_USER_DATA_PATH",
+        "CODEX_FORCE_MODEL_CATALOG",
+    ):
+        env.pop(key, None)
+
+    port = pick_free_port()
+    server = subprocess.Popen(
+        [str(OFFICIAL_CODEX_CLI), "app-server", "--listen", f"ws://127.0.0.1:{port}"],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        time.sleep(1.2)
+        script = f"""
+const ws = new WebSocket('ws://127.0.0.1:{port}');
+ws.onopen = () => ws.send(JSON.stringify({{jsonrpc:'2.0',id:'init',method:'initialize',params:{{protocolVersion:'2025-06-18',clientInfo:{{name:'sync',version:'0'}},capabilities:{{}}}}}}));
+ws.onmessage = (event) => {{
+  const msg = JSON.parse(String(event.data));
+  if (msg.id === 'init') {{
+    ws.send(JSON.stringify({{jsonrpc:'2.0',method:'notifications/initialized',params:{{}}}}));
+    ws.send(JSON.stringify({{jsonrpc:'2.0',id:'models',method:'model/list',params:{{}}}}));
+    return;
+  }}
+  if (msg.id === 'models') {{
+    const items = (msg.result?.data || []).filter((m) => !m.hidden).map((m) => m.id).filter(Boolean);
+    console.log(JSON.stringify(items));
+    process.exit(0);
+  }}
+}};
+ws.onerror = (err) => {{ console.error(err.message || err); process.exit(1); }};
+setTimeout(() => process.exit(2), 10000);
+"""
+        result = subprocess.run(
+            ["node", "-e", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        if result.returncode != 0:
+            return []
+        payload = result.stdout.strip()
+        if not payload:
+            return []
+        model_ids = json.loads(payload)
+        if not isinstance(model_ids, list):
+            return []
+        return [
+            model_id
+            for model_id in model_ids
+            if isinstance(model_id, str) and model_id not in EXCLUDED_OPENAI_MODEL_SLUGS
+        ]
+    except Exception:
+        return []
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            server.kill()
+
+
+def load_models(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+
+    data = load_json(path)
+    models = data.get("models")
+    if not isinstance(models, list):
+        return []
+
+    return [model for model in models if isinstance(model, dict) and model.get("slug")]
+
+
+def is_user_selectable_model(model: dict) -> bool:
+    slug = model.get("slug")
+    if not isinstance(slug, str) or not slug or slug in EXCLUDED_MODEL_SLUGS:
+        return False
+
+    visibility = model.get("visibility")
+    if visibility in {"hidden", "internal"}:
+        return False
+
+    return True
+
+
+def base_slug_candidates(model_id: str) -> list[str]:
+    parts = model_id.split("-")
+    return ["-".join(parts[:size]) for size in range(len(parts) - 1, 0, -1)]
+
+
+def next_free_priority(start: int, used: set[int]) -> int:
+    priority = max(start, 1)
+    while priority in used:
+        priority += 1
+    used.add(priority)
+    return priority
+
+
+def synthesize_model_info(model_id: str, template: dict, used_priorities: set[int]) -> dict:
+    model = copy.deepcopy(template)
+    model["slug"] = model_id
+    model["display_name"] = model_id
+    model["visibility"] = "list"
+    model["supported_in_api"] = True
+    model["description"] = f"Provider-supported model derived from {template['slug']}."
+    base_priority = int(template.get("priority", 100))
+    model["priority"] = next_free_priority(base_priority + 1, used_priorities)
+    upgrade = model.get("upgrade")
+    if isinstance(upgrade, dict) and upgrade.get("model") == template.get("slug"):
+        model["upgrade"] = dict(upgrade)
+        model["upgrade"]["model"] = template.get("upgrade", {}).get("model", "gpt-5.4")
+    return model
+
+
+def build_thirdparty_catalog() -> dict:
+    source_models: list[dict] = []
+    for path in (ALL_MODELS_CATALOG_PATH, BASE_MODEL_CATALOG_PATH, MODELS_CACHE_PATH):
+        source_models.extend(load_models(path))
+
+    if not source_models:
+        raise RuntimeError("no source model catalogs available")
+
+    model_by_slug: dict[str, dict] = {}
+    ordered_ids: list[str] = []
+    for model in source_models:
+        slug = str(model["slug"])
+        model_by_slug.setdefault(slug, model)
+        if is_user_selectable_model(model) and slug not in ordered_ids:
+            ordered_ids.append(slug)
+
+    provider_model_ids: list[str] = []
+    try:
+        provider_model_ids = fetch_provider_model_ids()
+    except Exception:
+        provider_model_ids = []
+
+    if provider_model_ids:
+        ordered_ids = [model_id for model_id in provider_model_ids if model_id not in EXCLUDED_MODEL_SLUGS]
+
+    fallback_template = model_by_slug.get("gpt-5.4") or next(iter(model_by_slug.values()))
+    used_priorities = {
+        int(model.get("priority", 0))
+        for model in model_by_slug.values()
+        if isinstance(model.get("priority"), int)
+    }
+
+    models: list[dict] = []
+    for model_id in ordered_ids:
+        if model_id in model_by_slug:
+            model = copy.deepcopy(model_by_slug[model_id])
+        else:
+            template = None
+            for candidate in base_slug_candidates(model_id):
+                if candidate in model_by_slug:
+                    template = model_by_slug[candidate]
+                    break
+            if template is None:
+                template = fallback_template
+            model = synthesize_model_info(model_id, template, used_priorities)
+
+        model["visibility"] = "list"
+        model["supported_in_api"] = True
+        models.append(model)
+
+    models.sort(key=lambda item: int(item.get("priority", 10**9)))
+    return {"models": models}
+
+
+def openai_family_key(slug: str) -> tuple[int, int] | None:
+    match = re.match(r"^gpt-(\d+)\.(\d+)(?:$|-)", slug)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def build_openai_catalog(target_home: Path) -> dict:
+    source_models: list[dict] = []
+    for path in (MODELS_CACHE_PATH, OPENAI_CACHE_CATALOG_PATH, ALL_MODELS_CATALOG_PATH):
+        source_models.extend(load_models(path))
+
+    if not source_models:
+        raise RuntimeError("no source OpenAI model catalogs available")
+
+    model_by_slug: dict[str, dict] = {}
+    ordered_slugs: list[str] = []
+    for model in source_models:
+        slug = str(model["slug"])
+        model_by_slug.setdefault(slug, model)
+        if slug not in ordered_slugs:
+            ordered_slugs.append(slug)
+
+    runtime_order = fetch_openai_runtime_model_ids(target_home)
+    if runtime_order:
+        ordered_slugs = runtime_order
+    else:
+        ordered_slugs = [
+            slug
+            for slug in ordered_slugs
+            if slug not in EXCLUDED_OPENAI_MODEL_SLUGS
+            and is_user_selectable_model(model_by_slug[slug])
+        ]
+
+    fallback = (
+        model_by_slug.get("gpt-5.4")
+        or model_by_slug.get("gpt-5.3-codex")
+        or next(iter(model_by_slug.values()))
+    )
+    used_priorities = {
+        int(model.get("priority", 0))
+        for model in model_by_slug.values()
+        if isinstance(model.get("priority"), int)
+    }
+
+    models: list[dict] = []
+    for slug in ordered_slugs:
+        if slug in EXCLUDED_OPENAI_MODEL_SLUGS:
+            continue
+        if slug in model_by_slug:
+            model = copy.deepcopy(model_by_slug[slug])
+        else:
+            template = None
+            for candidate in base_slug_candidates(slug):
+                if candidate in model_by_slug:
+                    template = model_by_slug[candidate]
+                    break
+            if template is None:
+                template = fallback
+            model = synthesize_model_info(slug, template, used_priorities)
+
+        if not is_user_selectable_model(model):
+            continue
+        model["visibility"] = "list"
+        model["supported_in_api"] = True
+        models.append(model)
+
+    if not models:
+        fallback_model = copy.deepcopy(fallback)
+        fallback_model["visibility"] = "list"
+        fallback_model["supported_in_api"] = True
+        models.append(fallback_model)
+
+    models.sort(key=lambda item: int(item.get("priority", 10**9)))
+    return {"models": models}
+
+
+def ensure_shared_entry(target_home: Path, name: str) -> None:
+    source = BASE_CODEX_HOME / name
+    target = target_home / name
+    if not source.exists():
+        return
+
+    if target.is_symlink():
+        if target.resolve() == source.resolve():
+            return
+        target.unlink()
+    elif target.exists():
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.symlink_to(source, target_is_directory=source.is_dir())
+
+
+def ensure_private_entry(target_home: Path, name: str) -> None:
+    target = target_home / name
+    if target.is_symlink():
+        target.unlink()
+
+
+def write_thirdparty_catalog(target_home: Path) -> None:
+    catalog = build_thirdparty_catalog()
+    catalog_path = target_home / "model-catalogs" / "thirdparty.json"
+    catalog_path.write_text(
+        json.dumps(catalog, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def write_openai_catalog(target_home: Path) -> None:
+    catalog = build_openai_catalog(target_home)
+    catalog_path = target_home / "model-catalogs" / "openai.json"
+    catalog_path.write_text(
+        json.dumps(catalog, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def build_config(profile: str, target_home: Path) -> str:
+    if not SOURCE_CONFIG_PATH.exists():
+        raise RuntimeError(f"missing source config: {SOURCE_CONFIG_PATH}")
+
+    text = SOURCE_CONFIG_PATH.read_text(encoding="utf-8")
+    text = prune_missing_projects(text)
+
+    if profile == "thirdparty":
+        catalog_path = str(target_home / "model-catalogs" / "thirdparty.json")
+        text = upsert_top_level_value(text, "model_provider", "thirdparty")
+        text = upsert_top_level_value(text, "model", "gpt-5.4")
+        text = upsert_top_level_value(text, "model_catalog_json", catalog_path)
+        text = upsert_top_level_value(text, "service_tier", None)
+        text = upsert_profile_catalog(text, catalog_path)
+    elif profile == "openai":
+        text = upsert_top_level_value(text, "model_provider", "openai")
+        text = upsert_top_level_value(text, "model", "gpt-5.4")
+        text = remove_named_section(text, "model_providers.thirdparty")
+        text = remove_named_section(text, "model_providers.thirdparty.auth")
+        text = remove_named_section(text, "profiles.thirdparty")
+        text = upsert_top_level_value(text, "model_catalog_json", None)
+    else:
+        raise RuntimeError(f"unsupported profile: {profile}")
+
+    text = re.sub(r"\n{3,}", "\n\n", text).strip() + "\n"
+    return text
+
+
+def main() -> int:
+    if len(sys.argv) != 3:
+        print("usage: codex-sync-desktop-home <openai|thirdparty> <target_home>", file=sys.stderr)
+        return 2
+
+    profile = sys.argv[1].strip()
+    target_home = Path(sys.argv[2]).expanduser().resolve()
+    target_home.mkdir(parents=True, exist_ok=True)
+    (target_home / "model-catalogs").mkdir(parents=True, exist_ok=True)
+
+    for entry in SHARED_ENTRIES:
+        ensure_shared_entry(target_home, entry)
+
+    ensure_private_entry(target_home, "models_cache.json")
+
+    config_text = build_config(profile, target_home)
+    (target_home / "config.toml").write_text(config_text, encoding="utf-8")
+    if profile == "thirdparty":
+        ensure_shared_entry(target_home, THIRDPARTY_ENV_NAME)
+        write_thirdparty_catalog(target_home)
+    elif profile == "openai":
+        write_openai_catalog(target_home)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

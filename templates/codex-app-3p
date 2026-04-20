@@ -1,0 +1,45 @@
+#!/bin/zsh
+set -euo pipefail
+
+workspace="${1:-$PWD}"
+if [ -d "$workspace" ]; then
+  workspace="$(cd "$workspace" && pwd -P)"
+fi
+source_app="/Applications/Codex.app"
+source_cli="$source_app/Contents/Resources/codex"
+target_app="$HOME/Applications/Codex 3P.app"
+target_bin="$target_app/Contents/MacOS/Codex"
+thirdparty_cli="$HOME/.local/bin/codex-3p"
+desktop_home="$HOME/.codex/app-homes/thirdparty"
+electron_user_data="$HOME/.codex/electron-user-data-thirdparty"
+log_dir="$HOME/.codex/logs"
+log_file="$log_dir/codex-app-3p.log"
+sync_home="$HOME/.codex/bin/codex-sync-desktop-home"
+prepare_app="$HOME/.codex/bin/codex-prepare-desktop-3p-app"
+
+for required in "$source_cli" "$thirdparty_cli" "$sync_home" "$prepare_app"; do
+  if [ ! -x "$required" ]; then
+    print -u2 "required executable not found: $required"
+    exit 1
+  fi
+done
+
+mkdir -p "$log_dir"
+"$sync_home" thirdparty "$desktop_home"
+CODEX_HOME="$desktop_home" CODEX_FORCE_MODEL_CATALOG=1 "$thirdparty_cli" --version >"$log_file" 2>&1
+"$prepare_app" "$source_app" "$target_app" >/dev/null
+defaults write com.openai.codex.thirdparty SUEnableAutomaticChecks -bool false >/dev/null 2>&1 || true
+defaults write com.openai.codex.thirdparty SUAutomaticallyUpdate -bool false >/dev/null 2>&1 || true
+
+print "Opening Codex 3P at $target_app..."
+print "Opening workspace $workspace..."
+
+env \
+  CODEX_HOME="$desktop_home" \
+  CODEX_CLI_PATH="$thirdparty_cli" \
+  CODEX_ELECTRON_APP_NAME="Codex 3P" \
+  CODEX_ELECTRON_USER_DATA_PATH="$electron_user_data" \
+  "$target_bin" \
+  --use-mock-keychain \
+  "$workspace" \
+  >"$log_file" 2>&1 < /dev/null &!

@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+
+import shutil
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+
+BASE_CODEX_HOME = Path.home() / ".codex"
+CONFIG_PATH = BASE_CODEX_HOME / "config.toml"
+SYNC_SCRIPT = BASE_CODEX_HOME / "bin" / "codex-sync-desktop-home"
+OPENAI_HOME = BASE_CODEX_HOME / "app-homes" / "openai"
+THIRDPARTY_HOME = BASE_CODEX_HOME / "app-homes" / "thirdparty"
+
+
+def rewrite_global_config(text: str) -> tuple[str, bool]:
+    lines = text.splitlines()
+    output: list[str] = []
+    changed = False
+    seen_model_provider = False
+    in_top_level = True
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("["):
+            if in_top_level and not seen_model_provider:
+                output.append('model_provider = "openai"')
+                seen_model_provider = True
+                changed = True
+            in_top_level = False
+            output.append(line)
+            continue
+
+        if in_top_level:
+            if stripped.startswith("model_provider"):
+                seen_model_provider = True
+                if stripped != 'model_provider = "openai"':
+                    output.append('model_provider = "openai"')
+                    changed = True
+                else:
+                    output.append(line)
+                continue
+            if stripped.startswith("model_catalog_json"):
+                changed = True
+                continue
+
+        output.append(line)
+
+    if not seen_model_provider:
+        output.insert(0, 'model_provider = "openai"')
+        changed = True
+
+    result = "\n".join(output).rstrip() + "\n"
+    return result, changed
+
+
+def sync_home(profile: str, target: Path) -> None:
+    subprocess.run([str(SYNC_SCRIPT), profile, str(target)], check=True)
+
+
+def main() -> int:
+    if not CONFIG_PATH.exists():
+        print(f"missing config file: {CONFIG_PATH}", file=sys.stderr)
+        return 1
+    if not SYNC_SCRIPT.exists():
+        print(f"missing sync script: {SYNC_SCRIPT}", file=sys.stderr)
+        return 1
+
+    original = CONFIG_PATH.read_text(encoding="utf-8")
+    updated, changed = rewrite_global_config(original)
+
+    if changed:
+        backup = CONFIG_PATH.with_name(
+            f"{CONFIG_PATH.name}.bak.{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        )
+        shutil.copy2(CONFIG_PATH, backup)
+        CONFIG_PATH.write_text(updated, encoding="utf-8")
+        print(f"updated global desktop default: {CONFIG_PATH}")
+        print(f"backup written: {backup}")
+    else:
+        print(f"global desktop default already set: {CONFIG_PATH}")
+
+    sync_home("openai", OPENAI_HOME)
+    sync_home("thirdparty", THIRDPARTY_HOME)
+    print("refreshed desktop app homes: openai, thirdparty")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

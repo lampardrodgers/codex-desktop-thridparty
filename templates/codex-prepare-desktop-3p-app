@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+
+import hashlib
+import plistlib
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+PATCH_REVISION = "20260418.7"
+HOME_DIR = Path.home()
+THIRDPARTY_CODEX_HOME = str(HOME_DIR / ".codex" / "app-homes" / "thirdparty")
+THIRDPARTY_CLI_PATH = str(HOME_DIR / ".local" / "bin" / "codex-3p")
+THIRDPARTY_USER_DATA_PATH = str(HOME_DIR / ".codex" / "electron-user-data-thirdparty")
+THIRDPARTY_APP_NAME = "Codex 3P"
+THIRDPARTY_ENVIRONMENT = {
+    "CODEX_HOME": THIRDPARTY_CODEX_HOME,
+    "CODEX_CLI_PATH": THIRDPARTY_CLI_PATH,
+    "CODEX_ELECTRON_APP_NAME": THIRDPARTY_APP_NAME,
+    "CODEX_ELECTRON_USER_DATA_PATH": THIRDPARTY_USER_DATA_PATH,
+    "CODEX_FORCE_MODEL_CATALOG": "1",
+}
+
+
+def read_version(app_path: Path) -> str:
+    info_plist = app_path / "Contents" / "Info.plist"
+    with info_plist.open("rb") as handle:
+        info = plistlib.load(handle)
+    return str(
+        info.get("CFBundleVersion")
+        or info.get("CFBundleShortVersionString")
+        or "unknown"
+    )
+
+
+def customize_info_plist(app_path: Path, asar_hash: str | None = None) -> None:
+    info_plist = app_path / "Contents" / "Info.plist"
+    with info_plist.open("rb") as handle:
+        info = plistlib.load(handle)
+
+    info["CFBundleIdentifier"] = "com.openai.codex.thirdparty"
+    info["CFBundleName"] = "Codex"
+    info["CFBundleDisplayName"] = "Codex 3P"
+    if asar_hash is not None:
+        integrity = dict(info.get("ElectronAsarIntegrity") or {})
+        entry = dict(integrity.get("Resources/app.asar") or {})
+        entry["algorithm"] = "SHA256"
+        entry["hash"] = asar_hash
+        integrity["Resources/app.asar"] = entry
+        info["ElectronAsarIntegrity"] = integrity
+    ls_environment = dict(info.get("LSEnvironment") or {})
+    ls_environment.update(THIRDPARTY_ENVIRONMENT)
+    info["LSEnvironment"] = ls_environment
+
+    with info_plist.open("wb") as handle:
+        plistlib.dump(info, handle)
+
+
+def has_expected_identity(app_path: Path) -> bool:
+    info_plist = app_path / "Contents" / "Info.plist"
+    if not info_plist.exists():
+        return False
+
+    with info_plist.open("rb") as handle:
+        info = plistlib.load(handle)
+
+    return (
+        info.get("CFBundleIdentifier") == "com.openai.codex.thirdparty"
+        and info.get("CFBundleName") == "Codex"
+        and info.get("CFBundleDisplayName") == "Codex 3P"
+    )
+
+
+def has_valid_signature(app_path: Path) -> bool:
+    result = subprocess.run(
+        ["codesign", "--verify", "--deep", "--strict", str(app_path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def sign_app(app_path: Path) -> None:
+    subprocess.run(
+        ["codesign", "--force", "--deep", "--sign", "-", str(app_path)],
+        check=True,
+    )
+
+
+def get_asar_header_hash(path: Path) -> str:
+    blob = path.read_bytes()
+    json_len = struct.unpack_from("<I", blob, 12)[0]
+    header_json = blob[16 : 16 + json_len]
+    return hashlib.sha256(header_json).hexdigest()
+
+
+def patch_font_settings(font_path: Path) -> None:
+    text = font_path.read_text(encoding="utf-8")
+    replacements = [
+        (
+            "var et=100,tt=[`models`,`list`];function nt(e,t,n=et){return[...tt,e,t??`no-auth`,n]}",
+            "var et=100,tt=[`models`,`list`],__codexThirdpartyVisibleModel=`gpt-5.3-codex-spark`,__codexThirdpartyFastModels=new Set([`gpt-5.4`,`gpt-5.4-mini`,`gpt-5.3-codex`,`gpt-5.3-codex-spark`,`gpt-5.2`]),__codexThirdpartySparkDefaults={id:`gpt-5.3-codex-spark`,model:`gpt-5.3-codex-spark`,upgrade:`gpt-5.4`,upgradeInfo:{model:`gpt-5.4`,upgradeCopy:null,modelLink:null,migrationMarkdown:`Introducing GPT-5.4\\n\\nCodex just got an upgrade with GPT-5.4, our most capable model for professional work. It outperforms prior models while being more token efficient, with notable improvements on long-running tasks, tool calling, computer use, and frontend development.\\n\\nLearn more: https://openai.com/index/introducing-gpt-5-4\\n\\nYou can always keep using GPT-5.3-Codex if you prefer.\\n`},availabilityNux:null,displayName:`gpt-5.3-codex-spark`,description:`Provider-supported model derived from gpt-5.3-codex.`,hidden:!1,supportedReasoningEfforts:[{reasoningEffort:`low`,description:`Fast responses with lighter reasoning`},{reasoningEffort:`medium`,description:`Balances speed and reasoning depth for everyday tasks`},{reasoningEffort:`high`,description:`Greater reasoning depth for complex problems`},{reasoningEffort:`xhigh`,description:`Extra high reasoning depth for complex problems`}],defaultReasoningEffort:`medium`,inputModalities:[`text`,`image`],supportsPersonality:!0,additionalSpeedTiers:[`fast`],isDefault:!1};function nt(e,t,n=et){return[...tt,e,t??`no-auth`,n]}function __codexNormalizeThirdpartyModel(e){if(e==null||typeof e!=`object`)return e;let t={...e},n=t.model??t.id;return(t.model===__codexThirdpartyVisibleModel||t.id===__codexThirdpartyVisibleModel)&&(t.id=__codexThirdpartyVisibleModel,t.model=__codexThirdpartyVisibleModel,t.displayName=t.displayName??`gpt-5.3-codex-spark`,t.hidden=!1,n=__codexThirdpartyVisibleModel),__codexThirdpartyFastModels.has(n)&&(Array.isArray(t.additionalSpeedTiers)?t.additionalSpeedTiers.includes(`fast`)||(t.additionalSpeedTiers=[...t.additionalSpeedTiers,`fast`]):t.additionalSpeedTiers=[`fast`],Array.isArray(t.additional_speed_tiers)?t.additional_speed_tiers.includes(`fast`)||(t.additional_speed_tiers=[...t.additional_speed_tiers,`fast`]):t.additional_speed_tiers=[`fast`]),t}function __codexBuildThirdpartySparkModel(e){let t=e&&typeof e==`object`?{...e}:{...__codexThirdpartySparkDefaults};return t.id=__codexThirdpartyVisibleModel,t.model=__codexThirdpartyVisibleModel,t.displayName=`gpt-5.3-codex-spark`,t.description=`Provider-supported model derived from gpt-5.3-codex.`,t.hidden=!1,t.isDefault=!1,t.upgrade=`gpt-5.4`,t.upgradeInfo=t.upgradeInfo??__codexThirdpartySparkDefaults.upgradeInfo,t.supportedReasoningEfforts=Array.isArray(t.supportedReasoningEfforts)&&t.supportedReasoningEfforts.length>0?t.supportedReasoningEfforts:__codexThirdpartySparkDefaults.supportedReasoningEfforts,t.defaultReasoningEffort=t.defaultReasoningEffort??`medium`,t.inputModalities=Array.isArray(t.inputModalities)&&t.inputModalities.length>0?t.inputModalities:[`text`,`image`],t.supportsPersonality=t.supportsPersonality??!0,t.availabilityNux=t.availabilityNux??null,t.additionalSpeedTiers=Array.isArray(t.additionalSpeedTiers)?[...t.additionalSpeedTiers]:[`fast`],__codexNormalizeThirdpartyModel(t)}function __codexEnsureThirdpartyModels(e){let t=Array.isArray(e)?e.map(__codexNormalizeThirdpartyModel):[],n=t.find(e=>e&&typeof e==`object`&&e.model===__codexThirdpartyVisibleModel);if(n)return t;let r=t.find(e=>e&&typeof e==`object`&&e.model===`gpt-5.3-codex`)??t.find(e=>e&&typeof e==`object`&&e.model===`gpt-5.4`)??null;return[...t,__codexBuildThirdpartySparkModel(r)]}",
+        ),
+        (
+            "f=()=>P(`list-models-for-host`,{hostId:n,includeHidden:!0,cursor:null,limit:r})",
+            "f=()=>n===l?P(`list-models-for-host`,{hostId:n,includeHidden:!0,cursor:null,limit:r}).then(e=>{let t=e??{};return{...t,data:__codexEnsureThirdpartyModels(t.data)}}):P(`list-models-for-host`,{hostId:n,includeHidden:!0,cursor:null,limit:r})",
+        ),
+        (
+            "let{data:t}=e,n={models:[]},r=null;return t.forEach(e=>{",
+            "let{data:t}=e,n={models:[]},r=null,i=__codexEnsureThirdpartyModels(t);return i.forEach(e=>{",
+        ),
+        (
+            "if(c.useHiddenModels?c.availableModels.has(e.model):!e.hidden){",
+            "if(c.useHiddenModels?c.availableModels.has(e.model)||e.model===__codexThirdpartyVisibleModel:!e.hidden||e.model===__codexThirdpartyVisibleModel){",
+        ),
+        (
+            "function pt(e){return e===`chatgpt`}",
+            "function pt(e){return!0}",
+        ),
+    ]
+
+    for old, new in replacements:
+        if new in text:
+            continue
+        if old not in text:
+            raise RuntimeError(f"missing patch anchor in {font_path.name}: {old[:48]}...")
+        text = text.replace(old, new, 1)
+
+    font_path.write_text(text, encoding="utf-8")
+
+
+def patch_bootstrap(bootstrap_path: Path) -> None:
+    text = bootstrap_path.read_text(encoding="utf-8")
+    replacements = [
+        (
+            "var y=process.platform===`darwin`,b=e.d.resolve();t.app.setName(e.Pr(b)),t.app.setPath(`userData`,g({appDataPath:t.app.getPath(`appData`),buildFlavor:b,env:process.env})),process.platform===`win32`&&t.app.setAppUserModelId(e.r(b));",
+            "var y=process.platform===`darwin`,b=e.d.resolve(),__codexThirdpartyDefaults={CODEX_HOME:`"
+            + THIRDPARTY_CODEX_HOME
+            + "`,CODEX_CLI_PATH:`"
+            + THIRDPARTY_CLI_PATH
+            + "`,CODEX_ELECTRON_APP_NAME:`"
+            + THIRDPARTY_APP_NAME
+            + "`,CODEX_ELECTRON_USER_DATA_PATH:`"
+            + THIRDPARTY_USER_DATA_PATH
+            + "`,CODEX_FORCE_MODEL_CATALOG:`1`};for(let[e,t]of Object.entries(__codexThirdpartyDefaults)){let n=process.env[e]?.trim();n&&n.length>0||(process.env[e]=t)}var S=process.env.CODEX_ELECTRON_APP_NAME?.trim()||`"
+            + THIRDPARTY_APP_NAME
+            + "`;t.app.setName(S),t.app.setPath(`userData`,g({appDataPath:t.app.getPath(`appData`),buildFlavor:b,env:process.env})),process.platform===`win32`&&t.app.setAppUserModelId(e.r(b));",
+        ),
+    ]
+
+    for old, new in replacements:
+        if new in text:
+            continue
+        if old not in text:
+            raise RuntimeError(f"missing patch anchor in {bootstrap_path.name}: {old[:48]}...")
+        text = text.replace(old, new, 1)
+
+    bootstrap_path.write_text(text, encoding="utf-8")
+
+
+def patch_index_bundle(index_path: Path) -> None:
+    text = index_path.read_text(encoding="utf-8")
+    replacements = [
+        (
+            "let E=o&&d&&l!==`error`&&p.length>0,D;",
+            "let E=d&&l!==`error`&&p.length>0,D;",
+        ),
+        (
+            "let w=s&&f&&!p,T;",
+            "let w=f&&!p,T;",
+        ),
+    ]
+
+    for old, new in replacements:
+        if new in text:
+            continue
+        if old not in text:
+            raise RuntimeError(f"missing patch anchor in {index_path.name}: {old[:48]}...")
+        text = text.replace(old, new, 1)
+
+    index_path.write_text(text, encoding="utf-8")
+
+
+def prepare_clone(source_app: Path, target_app: Path) -> Path:
+    source_app = source_app.expanduser().resolve()
+    target_app = target_app.expanduser().resolve()
+
+    if source_app == target_app:
+        raise RuntimeError(
+            f"refusing to patch app in place: source_app and target_app are both {source_app}"
+        )
+
+    target_app.parent.mkdir(parents=True, exist_ok=True)
+
+    source_version = read_version(source_app)
+    marker_path = target_app / "Contents" / "Resources" / ".codex-3p-source-version"
+    patch_marker_path = target_app / "Contents" / "Resources" / ".codex-3p-patch-revision"
+    target_version = marker_path.read_text(encoding="utf-8").strip() if marker_path.exists() else None
+    target_patch_revision = (
+        patch_marker_path.read_text(encoding="utf-8").strip()
+        if patch_marker_path.exists()
+        else None
+    )
+
+    if (
+        target_app.exists()
+        and target_version == source_version
+        and target_patch_revision == PATCH_REVISION
+        and has_expected_identity(target_app)
+        and has_valid_signature(target_app)
+    ):
+        return target_app
+
+    if target_app.exists():
+        shutil.rmtree(target_app)
+
+    subprocess.run(["ditto", str(source_app), str(target_app)], check=True)
+
+    target_asar = target_app / "Contents" / "Resources" / "app.asar"
+    with tempfile.TemporaryDirectory(prefix="codex-3p-app-") as temp_dir:
+        temp_root = Path(temp_dir)
+        extracted = temp_root / "extracted"
+        patched_asar = temp_root / "app.asar"
+        subprocess.run(["npx", "--yes", "asar", "extract", str(target_asar), str(extracted)], check=True)
+        font_path = next((extracted / "webview" / "assets").glob("font-settings-*.js"))
+        patch_font_settings(font_path)
+        patch_index_bundle(next((extracted / "webview" / "assets").glob("index-*.js")))
+        patch_bootstrap(extracted / ".vite" / "build" / "bootstrap.js")
+        subprocess.run(["npx", "--yes", "asar", "pack", str(extracted), str(patched_asar)], check=True)
+        shutil.copy2(patched_asar, target_asar)
+
+    customize_info_plist(target_app, get_asar_header_hash(target_asar))
+    marker_path.write_text(source_version + "\n", encoding="utf-8")
+    patch_marker_path.write_text(PATCH_REVISION + "\n", encoding="utf-8")
+    sign_app(target_app)
+    return target_app
+
+
+def main() -> int:
+    if len(sys.argv) != 3:
+        print("usage: codex-prepare-desktop-3p-app <source_app> <target_app>", file=sys.stderr)
+        return 2
+
+    target_app = prepare_clone(Path(sys.argv[1]), Path(sys.argv[2]))
+    print(target_app)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

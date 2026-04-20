@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+
+import os
+import shutil
+import sys
+
+
+if sys.version_info < (3, 11):
+    candidate_pythons = [
+        os.environ.get("CODEX_PYTHON3"),
+        os.path.expanduser("~/miniforge3/bin/python3"),
+        "/opt/homebrew/bin/python3",
+        "/usr/local/bin/python3",
+    ]
+    for candidate in candidate_pythons:
+        if not candidate or not os.path.exists(candidate):
+            continue
+        os.execv(candidate, [candidate, __file__, *sys.argv[1:]])
+
+import copy
+import datetime
+import json
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+
+
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
+CONFIG_PATH = CODEX_HOME / "config.toml"
+MODELS_CACHE_PATH = CODEX_HOME / "models_cache.json"
+THIRDPARTY_ENV_PATH = CODEX_HOME / "thirdparty.env"
+FALLBACK_THIRDPARTY_ENV_PATH = Path.home() / ".codex" / "thirdparty.env"
+MODEL_CATALOG_PATH = CODEX_HOME / "model-catalogs" / "thirdparty.json"
+PROVIDER_NAME = "thirdparty"
+API_KEY_ENV = "CODEX_THIRDPARTY_API_KEY"
+CACHE_TTL_SECONDS = 300
+COMMANDS_WITH_CONFIG = {
+    "app",
+    "app-server",
+    "debug",
+    "exec",
+    "review",
+    "resume",
+}
+
+
+def resolve_real_codex() -> Path:
+    current = Path(__file__).resolve()
+    candidates = [
+        Path(os.environ.get("CODEX_REAL_CLI_PATH", "")).expanduser()
+        if os.environ.get("CODEX_REAL_CLI_PATH")
+        else None,
+        Path.home() / ".npm-global" / "bin" / "codex",
+        Path("/opt/homebrew/bin/codex"),
+        Path("/usr/local/bin/codex"),
+    ]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        if candidate.exists() and candidate.resolve() != current:
+            return candidate
+
+    path_hit = shutil.which("codex")
+    if path_hit:
+        candidate = Path(path_hit).expanduser().resolve()
+        if candidate != current:
+            return candidate
+
+    return Path.home() / ".npm-global" / "bin" / "codex"
+
+
+REAL_CODEX = resolve_real_codex()
+
+
+def load_json(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def load_toml(path: Path) -> dict:
+    with path.open("rb") as handle:
+        return tomllib.load(handle)
+
+
+def should_skip_injection(argv: list[str]) -> bool:
+    if os.environ.get("CODEX_SKIP_MODEL_CATALOG") == "1":
+        return True
+
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in {"-c", "--config"} and i + 1 < len(argv):
+            if argv[i + 1].startswith("model_catalog_json="):
+                return True
+            i += 2
+            continue
+        if arg.startswith("--config=") and "model_catalog_json=" in arg:
+            return True
+        i += 1
+    return False
+
+
+def load_dotenv(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.exists():
+        return values
+
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        values[key.strip()] = value.strip().strip("\"'")
+    return values
+
+
+def provider_config() -> dict:
+    if not CONFIG_PATH.exists():
+        raise RuntimeError(f"missing config file: {CONFIG_PATH}")
+
+    config = load_toml(CONFIG_PATH)
+    providers = config.get("model_providers", {})
+    provider = providers.get(PROVIDER_NAME)
+    if not provider:
+        raise RuntimeError(f"missing [model_providers.{PROVIDER_NAME}] in {CONFIG_PATH}")
+    return provider
+
+
+def ensure_api_key(env: dict[str, str]) -> str:
+    api_key = env.get(API_KEY_ENV)
+    if api_key:
+        return api_key
+
+    env.update(load_dotenv(THIRDPARTY_ENV_PATH))
+    api_key = env.get(API_KEY_ENV)
+    if api_key:
+        return api_key
+
+    if THIRDPARTY_ENV_PATH != FALLBACK_THIRDPARTY_ENV_PATH:
+        env.update(load_dotenv(FALLBACK_THIRDPARTY_ENV_PATH))
+        api_key = env.get(API_KEY_ENV)
+        if api_key:
+            return api_key
+
+    raise RuntimeError(
+        f"missing {API_KEY_ENV}; set it in the shell or in {THIRDPARTY_ENV_PATH}"
+    )
+
+
+def fetch_provider_model_ids(base_url: str, api_key: str) -> list[str]:
+    url = base_url.rstrip("/") + "/models"
+    request = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {api_key}", "User-Agent": "codex-thirdparty-launcher"},
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    items = payload.get("data") or payload.get("models") or []
+    ids: list[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            model_id = item.get("id") or item.get("slug")
+        else:
+            model_id = str(item)
+        if model_id:
+            ids.append(model_id)
+    return ids
+
+
+def load_cached_models() -> dict[str, dict]:
+    if not MODELS_CACHE_PATH.exists():
+        return {}
+    cache = load_json(MODELS_CACHE_PATH)
+    models = cache.get("models", [])
+    return {
+        model["slug"]: model
+        for model in models
+        if isinstance(model, dict) and model.get("slug")
+    }
+
+
+def load_models_cache_document() -> dict:
+    if not MODELS_CACHE_PATH.exists():
+        return {}
+    return load_json(MODELS_CACHE_PATH)
+
+
+def base_slug_candidates(model_id: str) -> list[str]:
+    parts = model_id.split("-")
+    candidates = []
+    for size in range(len(parts) - 1, 0, -1):
+        candidates.append("-".join(parts[:size]))
+    return candidates
+
+
+def next_free_priority(start: int, used: set[int]) -> int:
+    priority = max(start, 1)
+    while priority in used:
+        priority += 1
+    used.add(priority)
+    return priority
+
+
+def synthesize_model_info(model_id: str, template: dict, used_priorities: set[int]) -> dict:
+    model = copy.deepcopy(template)
+    model["slug"] = model_id
+    model["display_name"] = model_id
+    model["visibility"] = "list"
+    model["supported_in_api"] = True
+    model["description"] = f"Provider-supported model derived from {template['slug']}."
+    base_priority = int(template.get("priority", 100))
+    model["priority"] = next_free_priority(base_priority + 1, used_priorities)
+    upgrade = model.get("upgrade")
+    if isinstance(upgrade, dict) and upgrade.get("model") == template.get("slug"):
+        upgrade["model"] = template.get("upgrade", {}).get("model", "gpt-5.4")
+    return model
+
+
+def enable_fast_tier(model: dict) -> dict:
+    tiers = model.get("additional_speed_tiers")
+    if not isinstance(tiers, list):
+        tiers = []
+    if "fast" not in tiers:
+        tiers.append("fast")
+    model["additional_speed_tiers"] = tiers
+    return model
+
+
+def build_custom_catalog(model_ids: list[str], cached_models: dict[str, dict]) -> dict:
+    if not cached_models:
+        raise RuntimeError("models_cache.json is missing or empty")
+
+    fallback_template = cached_models.get("gpt-5.4") or next(iter(cached_models.values()))
+    used_priorities = {
+        int(model.get("priority", 0))
+        for model in cached_models.values()
+        if isinstance(model.get("priority"), int)
+    }
+
+    models: list[dict] = []
+    for model_id in model_ids:
+        if model_id in cached_models:
+            model = copy.deepcopy(cached_models[model_id])
+            model["visibility"] = "list"
+            model["supported_in_api"] = True
+            models.append(enable_fast_tier(model))
+            continue
+
+        template = None
+        for candidate in base_slug_candidates(model_id):
+            if candidate in cached_models:
+                template = cached_models[candidate]
+                break
+        if template is None:
+            template = fallback_template
+        models.append(enable_fast_tier(synthesize_model_info(model_id, template, used_priorities)))
+
+    models.sort(key=lambda item: int(item.get("priority", 10**9)))
+    return {"models": models}
+
+
+def utc_timestamp() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z"
+    )
+
+
+def build_models_cache_document(catalog: dict, existing_cache: dict) -> dict:
+    provided_models = catalog.get("models", [])
+    provided_slugs = {
+        model.get("slug")
+        for model in provided_models
+        if isinstance(model, dict) and model.get("slug")
+    }
+
+    preserved_models: list[dict] = []
+    for model in existing_cache.get("models", []):
+        if not isinstance(model, dict):
+            continue
+        slug = model.get("slug")
+        if not slug or slug in provided_slugs:
+            continue
+        if model.get("visibility") != "hide":
+            continue
+        preserved_models.append(copy.deepcopy(model))
+
+    models = [copy.deepcopy(model) for model in provided_models] + preserved_models
+    models.sort(key=lambda item: int(item.get("priority", 10**9)))
+    return {
+        "fetched_at": utc_timestamp(),
+        "etag": existing_cache.get("etag") or f"thirdparty-{int(time.time())}",
+        "client_version": existing_cache.get("client_version") or "0.0.0",
+        "models": models,
+    }
+
+
+def sync_models_cache(catalog: dict) -> None:
+    existing_cache = load_models_cache_document()
+    models_cache = build_models_cache_document(catalog, existing_cache)
+    MODELS_CACHE_PATH.write_text(
+        json.dumps(models_cache, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def catalog_is_fresh() -> bool:
+    if os.environ.get("CODEX_FORCE_MODEL_CATALOG") == "1":
+        return False
+    if not MODEL_CATALOG_PATH.exists():
+        return False
+    age_seconds = time.time() - MODEL_CATALOG_PATH.stat().st_mtime
+    return age_seconds <= CACHE_TTL_SECONDS
+
+
+def ensure_catalog(base_url: str, api_key: str) -> bool:
+    if catalog_is_fresh():
+        sync_models_cache(load_json(MODEL_CATALOG_PATH))
+        return True
+
+    model_ids = fetch_provider_model_ids(base_url, api_key)
+    if not model_ids:
+        return False
+
+    cached_models = load_cached_models()
+    catalog = build_custom_catalog(model_ids, cached_models)
+    MODEL_CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    MODEL_CATALOG_PATH.write_text(
+        json.dumps(catalog, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    sync_models_cache(catalog)
+    return True
+
+
+def build_exec_argv(original_argv: list[str], inject_catalog: bool) -> list[str]:
+    config_args = [
+        "-c",
+        f"model_provider={json.dumps(PROVIDER_NAME)}",
+    ]
+    if inject_catalog:
+        config_args.extend(["-c", f"model_catalog_json={json.dumps(str(MODEL_CATALOG_PATH))}"])
+    config_args.extend(["-c", f"service_tier={json.dumps('fast')}"])
+
+    args = original_argv[1:]
+    if args and args[0] in COMMANDS_WITH_CONFIG:
+        return [str(REAL_CODEX), args[0], *config_args, *args[1:]]
+    return [str(REAL_CODEX), *config_args, *args]
+
+
+def main() -> int:
+    if not REAL_CODEX.exists():
+        print(f"codex-3p: real executable not found at {REAL_CODEX}", file=sys.stderr)
+        return 127
+
+    provider = provider_config()
+    base_url = provider.get("base_url")
+    if not base_url:
+        print(
+            f"codex-3p: missing base_url in [model_providers.{PROVIDER_NAME}]",
+            file=sys.stderr,
+        )
+        return 1
+
+    env = dict(os.environ)
+    try:
+        api_key = ensure_api_key(env)
+    except RuntimeError as exc:
+        print(f"codex-3p: {exc}", file=sys.stderr)
+        return 1
+
+    inject_catalog = False
+    if not should_skip_injection(sys.argv[1:]):
+        try:
+            inject_catalog = ensure_catalog(base_url, api_key)
+        except (OSError, ValueError, KeyError, urllib.error.URLError, RuntimeError) as exc:
+            print(f"codex-3p: falling back to default catalog: {exc}", file=sys.stderr)
+
+    os.execve(str(REAL_CODEX), build_exec_argv(sys.argv, inject_catalog), env)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
