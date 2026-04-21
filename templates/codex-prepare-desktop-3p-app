@@ -2,6 +2,7 @@
 
 import hashlib
 import plistlib
+import re
 import shutil
 import struct
 import subprocess
@@ -10,7 +11,7 @@ import tempfile
 from pathlib import Path
 
 
-PATCH_REVISION = "20260420.1"
+PATCH_REVISION = "20260421.1"
 HOME_DIR = Path.home()
 THIRDPARTY_CODEX_HOME = str(HOME_DIR / ".codex" / "app-homes" / "thirdparty")
 THIRDPARTY_CLI_PATH = str(HOME_DIR / ".local" / "bin" / "codex-3p")
@@ -98,47 +99,136 @@ def get_asar_header_hash(path: Path) -> str:
     return hashlib.sha256(header_json).hexdigest()
 
 
+def replace_literal_once(text: str, old: str, new: str, path: Path) -> str:
+    if new in text:
+        return text
+    if old not in text:
+        raise RuntimeError(f"missing patch anchor in {path.name}: {old[:48]}...")
+    return text.replace(old, new, 1)
+
+
+def replace_pattern_once(
+    text: str,
+    pattern: str,
+    replacement,
+    path: Path,
+    *,
+    description: str,
+    marker: str | None = None,
+) -> str:
+    if marker is not None and marker in text:
+        return text
+
+    updated, count = re.subn(pattern, replacement, text, count=1)
+    if count != 1:
+        raise RuntimeError(f"missing patch anchor in {path.name}: {description}")
+    return updated
+
+
 def patch_font_settings(font_path: Path) -> None:
     text = font_path.read_text(encoding="utf-8")
-    replacements = [
-        (
-            "var et=100,tt=[`models`,`list`];function nt(e,t,n=et){return[...tt,e,t??`no-auth`,n]}",
-            "var et=100,tt=[`models`,`list`],__codexThirdpartyVisibleModel=`gpt-5.3-codex-spark`,__codexThirdpartyFastModels=new Set([`gpt-5.4`,`gpt-5.4-mini`,`gpt-5.3-codex`,`gpt-5.3-codex-spark`,`gpt-5.2`]),__codexThirdpartySparkDefaults={id:`gpt-5.3-codex-spark`,model:`gpt-5.3-codex-spark`,upgrade:`gpt-5.4`,upgradeInfo:{model:`gpt-5.4`,upgradeCopy:null,modelLink:null,migrationMarkdown:`Introducing GPT-5.4\\n\\nCodex just got an upgrade with GPT-5.4, our most capable model for professional work. It outperforms prior models while being more token efficient, with notable improvements on long-running tasks, tool calling, computer use, and frontend development.\\n\\nLearn more: https://openai.com/index/introducing-gpt-5-4\\n\\nYou can always keep using GPT-5.3-Codex if you prefer.\\n`},availabilityNux:null,displayName:`gpt-5.3-codex-spark`,description:`Provider-supported model derived from gpt-5.3-codex.`,hidden:!1,supportedReasoningEfforts:[{reasoningEffort:`low`,description:`Fast responses with lighter reasoning`},{reasoningEffort:`medium`,description:`Balances speed and reasoning depth for everyday tasks`},{reasoningEffort:`high`,description:`Greater reasoning depth for complex problems`},{reasoningEffort:`xhigh`,description:`Extra high reasoning depth for complex problems`}],defaultReasoningEffort:`medium`,inputModalities:[`text`,`image`],supportsPersonality:!0,additionalSpeedTiers:[`fast`],isDefault:!1};function nt(e,t,n=et){return[...tt,e,t??`no-auth`,n]}function __codexNormalizeThirdpartyModel(e){if(e==null||typeof e!=`object`)return e;let t={...e},n=t.model??t.id;return(t.model===__codexThirdpartyVisibleModel||t.id===__codexThirdpartyVisibleModel)&&(t.id=__codexThirdpartyVisibleModel,t.model=__codexThirdpartyVisibleModel,t.displayName=t.displayName??`gpt-5.3-codex-spark`,t.hidden=!1,n=__codexThirdpartyVisibleModel),__codexThirdpartyFastModels.has(n)&&(Array.isArray(t.additionalSpeedTiers)?t.additionalSpeedTiers.includes(`fast`)||(t.additionalSpeedTiers=[...t.additionalSpeedTiers,`fast`]):t.additionalSpeedTiers=[`fast`],Array.isArray(t.additional_speed_tiers)?t.additional_speed_tiers.includes(`fast`)||(t.additional_speed_tiers=[...t.additional_speed_tiers,`fast`]):t.additional_speed_tiers=[`fast`]),t}function __codexBuildThirdpartySparkModel(e){let t=e&&typeof e==`object`?{...e}:{...__codexThirdpartySparkDefaults};return t.id=__codexThirdpartyVisibleModel,t.model=__codexThirdpartyVisibleModel,t.displayName=`gpt-5.3-codex-spark`,t.description=`Provider-supported model derived from gpt-5.3-codex.`,t.hidden=!1,t.isDefault=!1,t.upgrade=`gpt-5.4`,t.upgradeInfo=t.upgradeInfo??__codexThirdpartySparkDefaults.upgradeInfo,t.supportedReasoningEfforts=Array.isArray(t.supportedReasoningEfforts)&&t.supportedReasoningEfforts.length>0?t.supportedReasoningEfforts:__codexThirdpartySparkDefaults.supportedReasoningEfforts,t.defaultReasoningEffort=t.defaultReasoningEffort??`medium`,t.inputModalities=Array.isArray(t.inputModalities)&&t.inputModalities.length>0?t.inputModalities:[`text`,`image`],t.supportsPersonality=t.supportsPersonality??!0,t.availabilityNux=t.availabilityNux??null,t.additionalSpeedTiers=Array.isArray(t.additionalSpeedTiers)?[...t.additionalSpeedTiers]:[`fast`],__codexNormalizeThirdpartyModel(t)}function __codexEnsureThirdpartyModels(e){let t=Array.isArray(e)?e.map(__codexNormalizeThirdpartyModel):[],n=t.find(e=>e&&typeof e==`object`&&e.model===__codexThirdpartyVisibleModel);if(n)return t;let r=t.find(e=>e&&typeof e==`object`&&e.model===`gpt-5.3-codex`)??t.find(e=>e&&typeof e==`object`&&e.model===`gpt-5.4`)??null;return[...t,__codexBuildThirdpartySparkModel(r)]}",
+    helper_block = (
+        "__codexThirdpartyVisibleModel=`gpt-5.3-codex-spark`,"
+        "__codexThirdpartyFastModels=new Set([`gpt-5.4`,`gpt-5.4-mini`,`gpt-5.3-codex`,`gpt-5.3-codex-spark`,`gpt-5.2`]),"
+        "__codexThirdpartySparkDefaults={id:`gpt-5.3-codex-spark`,model:`gpt-5.3-codex-spark`,upgrade:`gpt-5.4`,upgradeInfo:{model:`gpt-5.4`,upgradeCopy:null,modelLink:null,migrationMarkdown:`Introducing GPT-5.4\\n\\nCodex just got an upgrade with GPT-5.4, our most capable model for professional work. It outperforms prior models while being more token efficient, with notable improvements on long-running tasks, tool calling, computer use, and frontend development.\\n\\nLearn more: https://openai.com/index/introducing-gpt-5-4\\n\\nYou can always keep using GPT-5.3-Codex if you prefer.\\n`},availabilityNux:null,displayName:`gpt-5.3-codex-spark`,description:`Provider-supported model derived from gpt-5.3-codex.`,hidden:!1,supportedReasoningEfforts:[{reasoningEffort:`low`,description:`Fast responses with lighter reasoning`},{reasoningEffort:`medium`,description:`Balances speed and reasoning depth for everyday tasks`},{reasoningEffort:`high`,description:`Greater reasoning depth for complex problems`},{reasoningEffort:`xhigh`,description:`Extra high reasoning depth for complex problems`}],defaultReasoningEffort:`medium`,inputModalities:[`text`,`image`],supportsPersonality:!0,additionalSpeedTiers:[`fast`],isDefault:!1};"
+        "function __codexNormalizeThirdpartyModel(e){if(e==null||typeof e!=`object`)return e;let t={...e},n=t.model??t.id;return(t.model===__codexThirdpartyVisibleModel||t.id===__codexThirdpartyVisibleModel)&&(t.id=__codexThirdpartyVisibleModel,t.model=__codexThirdpartyVisibleModel,t.displayName=t.displayName??`gpt-5.3-codex-spark`,t.hidden=!1,n=__codexThirdpartyVisibleModel),__codexThirdpartyFastModels.has(n)&&(Array.isArray(t.additionalSpeedTiers)?t.additionalSpeedTiers.includes(`fast`)||(t.additionalSpeedTiers=[...t.additionalSpeedTiers,`fast`]):t.additionalSpeedTiers=[`fast`],Array.isArray(t.additional_speed_tiers)?t.additional_speed_tiers.includes(`fast`)||(t.additional_speed_tiers=[...t.additional_speed_tiers,`fast`]):t.additional_speed_tiers=[`fast`]),t}"
+        "function __codexBuildThirdpartySparkModel(e){let t=e&&typeof e==`object`?{...e}:{...__codexThirdpartySparkDefaults};return t.id=__codexThirdpartyVisibleModel,t.model=__codexThirdpartyVisibleModel,t.displayName=`gpt-5.3-codex-spark`,t.description=`Provider-supported model derived from gpt-5.3-codex.`,t.hidden=!1,t.isDefault=!1,t.upgrade=`gpt-5.4`,t.upgradeInfo=t.upgradeInfo??__codexThirdpartySparkDefaults.upgradeInfo,t.supportedReasoningEfforts=Array.isArray(t.supportedReasoningEfforts)&&t.supportedReasoningEfforts.length>0?t.supportedReasoningEfforts:__codexThirdpartySparkDefaults.supportedReasoningEfforts,t.defaultReasoningEffort=t.defaultReasoningEffort??`medium`,t.inputModalities=Array.isArray(t.inputModalities)&&t.inputModalities.length>0?t.inputModalities:[`text`,`image`],t.supportsPersonality=t.supportsPersonality??!0,t.availabilityNux=t.availabilityNux??null,t.additionalSpeedTiers=Array.isArray(t.additionalSpeedTiers)?[...t.additionalSpeedTiers]:[`fast`],__codexNormalizeThirdpartyModel(t)}"
+        "function __codexEnsureThirdpartyModels(e){let t=Array.isArray(e)?e.map(__codexNormalizeThirdpartyModel):[],n=t.find(e=>e&&typeof e==`object`&&e.model===__codexThirdpartyVisibleModel);if(n)return t;let r=t.find(e=>e&&typeof e==`object`&&e.model===`gpt-5.3-codex`)??t.find(e=>e&&typeof e==`object`&&e.model===`gpt-5.4`)??null;return[...t,__codexBuildThirdpartySparkModel(r)]}"
+    )
+    text = replace_pattern_once(
+        text,
+        r"var (?P<limit>\w+)=100,(?P<key>\w+)=\[`models`,`list`\];function (?P<builder>\w+)\(e,t,n=(?P=limit)\)\{return\[\.\.\.(?P=key),e,t\?\?`no-auth`,n\]\}",
+        lambda match: (
+            "var "
+            + match.group("limit")
+            + "=100,"
+            + match.group("key")
+            + "=[`models`,`list`],"
+            + helper_block
+            + ";function "
+            + match.group("builder")
+            + "(e,t,n="
+            + match.group("limit")
+            + "){return[..."
+            + match.group("key")
+            + ",e,t??`no-auth`,n]}"
         ),
-        (
-            "f=()=>P(`list-models-for-host`,{hostId:n,includeHidden:!0,cursor:null,limit:r})",
-            "f=()=>n===l?P(`list-models-for-host`,{hostId:n,includeHidden:!0,cursor:null,limit:r}).then(e=>{let t=e??{};return{...t,data:__codexEnsureThirdpartyModels(t.data)}}):P(`list-models-for-host`,{hostId:n,includeHidden:!0,cursor:null,limit:r})",
+        font_path,
+        description="models/list query builder",
+        marker="__codexThirdpartyVisibleModel=`gpt-5.3-codex-spark`",
+    )
+    text = replace_pattern_once(
+        text,
+        r"(?P<loader>\w+)=\(\)=>(?P<fetch>\w+)\(`list-models-for-host`,\{hostId:(?P<host>\w+),includeHidden:!0,cursor:null,limit:(?P<limit>\w+)\}\)",
+        lambda match: (
+            match.group("loader")
+            + "=()=>"
+            + match.group("fetch")
+            + "(`list-models-for-host`,{hostId:"
+            + match.group("host")
+            + ",includeHidden:!0,cursor:null,limit:"
+            + match.group("limit")
+            + "}).then(e=>{let t=e??{};return{...t,data:__codexEnsureThirdpartyModels(t.data)}})"
         ),
-        (
-            "let{data:t}=e,n={models:[]},r=null;return t.forEach(e=>{",
-            "let{data:t}=e,n={models:[]},r=null,i=__codexEnsureThirdpartyModels(t);return i.forEach(e=>{",
+        font_path,
+        description="list-models-for-host loader",
+        marker="data:__codexEnsureThirdpartyModels(t.data)",
+    )
+    text = replace_pattern_once(
+        text,
+        r"let\{data:(?P<data>\w+)\}=e,(?P<models>\w+)=\{models:\[\]\},(?P<default>\w+)=null;return (?P=data)\.forEach\(e=>\{",
+        lambda match: (
+            "let{data:"
+            + match.group("data")
+            + "}=e,"
+            + match.group("models")
+            + "={models:[]},"
+            + match.group("default")
+            + "=null,__codexThirdpartyModels=__codexEnsureThirdpartyModels("
+            + match.group("data")
+            + ");return __codexThirdpartyModels.forEach(e=>{"
         ),
-        (
-            "if(c.useHiddenModels?c.availableModels.has(e.model):!e.hidden){",
-            "if(c.useHiddenModels?c.availableModels.has(e.model)||e.model===__codexThirdpartyVisibleModel:!e.hidden||e.model===__codexThirdpartyVisibleModel){",
+        font_path,
+        description="model list selector",
+        marker="__codexThirdpartyModels=__codexEnsureThirdpartyModels(",
+    )
+    text = replace_pattern_once(
+        text,
+        r"if\((?P<config>\w+)\.useHiddenModels\?(?P=config)\.availableModels\.has\(e\.model\):!e\.hidden\)\{",
+        lambda match: (
+            "if("
+            + match.group("config")
+            + ".useHiddenModels?"
+            + match.group("config")
+            + ".availableModels.has(e.model)||e.model===__codexThirdpartyVisibleModel:!e.hidden||e.model===__codexThirdpartyVisibleModel){"
         ),
-        (
-            "function pt(e){return e===`chatgpt`}",
-            "function pt(e){return!0}",
-        ),
-    ]
-
-    for old, new in replacements:
-        if new in text:
-            continue
-        if old not in text:
-            raise RuntimeError(f"missing patch anchor in {font_path.name}: {old[:48]}...")
-        text = text.replace(old, new, 1)
+        font_path,
+        description="hidden model filter",
+        marker="availableModels.has(e.model)||e.model===__codexThirdpartyVisibleModel",
+    )
+    text = replace_pattern_once(
+        text,
+        r"function (?P<gate>\w+)\(e\)\{return e===`chatgpt`\}",
+        lambda match: f"function {match.group('gate')}(e){{return!0}}",
+        font_path,
+        description="fast mode auth gate",
+        marker="return!0}function Qe(){",
+    )
 
     font_path.write_text(text, encoding="utf-8")
 
 
 def patch_bootstrap(bootstrap_path: Path) -> None:
     text = bootstrap_path.read_text(encoding="utf-8")
-    replacements = [
-        (
-            "var y=process.platform===`darwin`,b=e.d.resolve();t.app.setName(e.Pr(b)),t.app.setPath(`userData`,g({appDataPath:t.app.getPath(`appData`),buildFlavor:b,env:process.env})),process.platform===`win32`&&t.app.setAppUserModelId(e.r(b));",
-            "var y=process.platform===`darwin`,b=e.d.resolve(),__codexThirdpartyDefaults={CODEX_HOME:`"
+    text = replace_pattern_once(
+        text,
+        r"var y=process\.platform===`darwin`,b=e\.(?P<resolver>\w+)\.resolve\(\);(?P<macos_call>e\.\w+\(y\),)?t\.app\.setName\(e\.\w+\(b\)\),t\.app\.setPath\(`userData`,g\(\{appDataPath:t\.app\.getPath\(`appData`\),buildFlavor:b,env:process\.env\}\)\),process\.platform===`win32`&&t\.app\.setAppUserModelId\(e\.(?P<app_id>\w+)\(b\)\);",
+        lambda match: (
+            "var y=process.platform===`darwin`,b=e."
+            + match.group("resolver")
+            + ".resolve();"
+            + (match.group("macos_call") or "")
+            + "__codexThirdpartyDefaults={CODEX_HOME:`"
             + THIRDPARTY_CODEX_HOME
             + "`,CODEX_CLI_PATH:`"
             + THIRDPARTY_CLI_PATH
@@ -148,16 +238,14 @@ def patch_bootstrap(bootstrap_path: Path) -> None:
             + THIRDPARTY_USER_DATA_PATH
             + "`,CODEX_FORCE_MODEL_CATALOG:`1`};for(let[e,t]of Object.entries(__codexThirdpartyDefaults)){let n=process.env[e]?.trim();n&&n.length>0||(process.env[e]=t)}var S=process.env.CODEX_ELECTRON_APP_NAME?.trim()||`"
             + THIRDPARTY_APP_NAME
-            + "`;t.app.setName(S),t.app.setPath(`userData`,g({appDataPath:t.app.getPath(`appData`),buildFlavor:b,env:process.env})),process.platform===`win32`&&t.app.setAppUserModelId(e.r(b));",
+            + "`;t.app.setName(S),t.app.setPath(`userData`,g({appDataPath:t.app.getPath(`appData`),buildFlavor:b,env:process.env})),process.platform===`win32`&&t.app.setAppUserModelId(e."
+            + match.group("app_id")
+            + "(b));"
         ),
-    ]
-
-    for old, new in replacements:
-        if new in text:
-            continue
-        if old not in text:
-            raise RuntimeError(f"missing patch anchor in {bootstrap_path.name}: {old[:48]}...")
-        text = text.replace(old, new, 1)
+        bootstrap_path,
+        description="desktop bootstrap app naming block",
+        marker="__codexThirdpartyDefaults={CODEX_HOME:`",
+    )
 
     bootstrap_path.write_text(text, encoding="utf-8")
 
@@ -176,11 +264,7 @@ def patch_index_bundle(index_path: Path) -> None:
     ]
 
     for old, new in replacements:
-        if new in text:
-            continue
-        if old not in text:
-            raise RuntimeError(f"missing patch anchor in {index_path.name}: {old[:48]}...")
-        text = text.replace(old, new, 1)
+        text = replace_literal_once(text, old, new, index_path)
 
     index_path.write_text(text, encoding="utf-8")
 

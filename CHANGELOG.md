@@ -1,5 +1,11 @@
 # Changelog
 
+## 20260421.1 - 2026-04-21
+
+- Updated `codex-prepare-desktop-3p-app` to patch `font-settings-*.js` and `bootstrap.js` using stable semantic anchors instead of brittle minified symbol names.
+- Fixed the `missing patch anchor in font-settings-*.js` failure triggered by newer Codex desktop asset bundles.
+- Bumped the bundled patch revision to keep generated 3P app clones aligned with the new patching logic.
+
 ## 20260420.1 - 2026-04-20
 
 - Updated `codex-app-3p` to launch Codex 3P in a detached child process so running the launcher from Terminal no longer closes the current tab.
