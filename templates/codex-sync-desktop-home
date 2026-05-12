@@ -9,9 +9,17 @@ import shutil
 import subprocess
 import sys
 import time
-import tomllib
 import urllib.request
 from pathlib import Path
+
+vendor_python = Path.home() / ".codex" / "vendor" / "python"
+if vendor_python.is_dir() and str(vendor_python) not in sys.path:
+    sys.path.insert(0, str(vendor_python))
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 
 
 BASE_CODEX_HOME = Path.home() / ".codex"
@@ -20,6 +28,9 @@ BASE_MODEL_CATALOG_PATH = BASE_CODEX_HOME / "model-catalogs" / "thirdparty.json"
 OPENAI_CACHE_CATALOG_PATH = BASE_CODEX_HOME / "model-catalogs" / "openai-models-cache.json"
 ALL_MODELS_CATALOG_PATH = BASE_CODEX_HOME / "all-models-catalog.json"
 MODELS_CACHE_PATH = BASE_CODEX_HOME / "models_cache.json"
+PLUGIN_CACHE_PATH = BASE_CODEX_HOME / "plugins" / "cache"
+LOCAL_MARKETPLACES_DIR = ".tmp/desktop-3p-local-marketplaces"
+LOCAL_MARKETPLACE_NAMES = {"openai-curated", "openai-primary-runtime"}
 OFFICIAL_CODEX_CLI = Path("/Applications/Codex.app/Contents/Resources/codex")
 SHARED_ENTRIES = [
     "archived_sessions",
@@ -42,6 +53,79 @@ THIRDPARTY_ENV_NAME = "thirdparty.env"
 API_KEY_ENV = "CODEX_THIRDPARTY_API_KEY"
 EXCLUDED_MODEL_SLUGS = {"codex-auto-review"}
 EXCLUDED_OPENAI_MODEL_SLUGS = {"codex-auto-review", "gpt-5.3-codex-spark"}
+MARKETPLACE_DISPLAY_NAMES = {
+    "openai-bundled": "OpenAI Bundled",
+    "openai-curated": "Codex official",
+    "openai-primary-runtime": "OpenAI Primary Runtime",
+}
+DEFAULT_REASONING_LEVELS = [
+    {"effort": "low", "description": "Fast responses with lighter reasoning"},
+    {"effort": "medium", "description": "Balances speed and reasoning depth for everyday tasks"},
+    {"effort": "high", "description": "Greater reasoning depth for complex problems"},
+    {"effort": "xhigh", "description": "Extra high reasoning depth for complex problems"},
+]
+DEFAULT_MODEL_TEMPLATES = [
+    {
+        "slug": "gpt-5.4",
+        "display_name": "gpt-5.4",
+        "description": "Strong model for everyday coding.",
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": DEFAULT_REASONING_LEVELS,
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": True,
+        "priority": 10,
+        "additional_speed_tiers": ["fast"],
+    },
+    {
+        "slug": "gpt-5.4-mini",
+        "display_name": "gpt-5.4-mini",
+        "description": "Small, fast, and cost-efficient model for simpler coding tasks.",
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": DEFAULT_REASONING_LEVELS,
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": True,
+        "priority": 20,
+        "additional_speed_tiers": ["fast"],
+    },
+    {
+        "slug": "gpt-5.3-codex",
+        "display_name": "gpt-5.3-codex",
+        "description": "Coding-optimized model.",
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": DEFAULT_REASONING_LEVELS,
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": True,
+        "priority": 30,
+        "additional_speed_tiers": ["fast"],
+    },
+    {
+        "slug": "gpt-5.3-codex-spark",
+        "display_name": "gpt-5.3-codex-spark",
+        "description": "Ultra-fast coding model.",
+        "default_reasoning_level": "high",
+        "supported_reasoning_levels": DEFAULT_REASONING_LEVELS,
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": True,
+        "priority": 40,
+        "additional_speed_tiers": ["fast"],
+    },
+    {
+        "slug": "gpt-5.2",
+        "display_name": "gpt-5.2",
+        "description": "Optimized for professional work and long-running agents.",
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": DEFAULT_REASONING_LEVELS,
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": True,
+        "priority": 50,
+        "additional_speed_tiers": ["fast"],
+    },
+]
 
 
 def remove_project_section(text: str, project_path: str) -> str:
@@ -54,6 +138,10 @@ def remove_named_section(text: str, section_name: str) -> str:
     header = f"[{section_name}]"
     pattern = rf"(?ms)^{re.escape(header)}\n.*?(?=^\[|\Z)"
     return re.sub(pattern, "", text)
+
+
+def toml_string(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
 
 
 def prune_missing_projects(text: str) -> str:
@@ -315,7 +403,7 @@ def build_thirdparty_catalog() -> dict:
         source_models.extend(load_models(path))
 
     if not source_models:
-        raise RuntimeError("no source model catalogs available")
+        source_models = [copy.deepcopy(model) for model in DEFAULT_MODEL_TEMPLATES]
 
     model_by_slug: dict[str, dict] = {}
     ordered_ids: list[str] = []
@@ -376,7 +464,7 @@ def build_openai_catalog(target_home: Path) -> dict:
         source_models.extend(load_models(path))
 
     if not source_models:
-        raise RuntimeError("no source OpenAI model catalogs available")
+        source_models = [copy.deepcopy(model) for model in DEFAULT_MODEL_TEMPLATES]
 
     model_by_slug: dict[str, dict] = {}
     ordered_slugs: list[str] = []
@@ -466,6 +554,173 @@ def ensure_private_entry(target_home: Path, name: str) -> None:
         target.unlink()
 
 
+def latest_cached_plugin_dir(plugin_root: Path) -> Path | None:
+    latest_link = plugin_root / "latest"
+    if (latest_link / ".codex-plugin" / "plugin.json").exists():
+        return latest_link
+
+    candidates = [
+        path
+        for path in plugin_root.iterdir()
+        if path.is_dir() and (path / ".codex-plugin" / "plugin.json").exists()
+    ]
+    if not candidates:
+        return None
+
+    return max(candidates, key=lambda path: (path.stat().st_mtime, path.name))
+
+
+def cached_plugin_sources() -> dict[str, list[tuple[str, Path, dict]]]:
+    if not PLUGIN_CACHE_PATH.exists():
+        return {}
+
+    marketplaces: dict[str, list[tuple[str, Path, dict]]] = {}
+    for marketplace_dir in sorted(PLUGIN_CACHE_PATH.iterdir()):
+        if not marketplace_dir.is_dir():
+            continue
+        if marketplace_dir.name not in LOCAL_MARKETPLACE_NAMES:
+            continue
+
+        plugins: list[tuple[str, Path, dict]] = []
+        for plugin_root in sorted(marketplace_dir.iterdir()):
+            if not plugin_root.is_dir():
+                continue
+
+            plugin_dir = latest_cached_plugin_dir(plugin_root)
+            if plugin_dir is None:
+                continue
+
+            manifest_path = plugin_dir / ".codex-plugin" / "plugin.json"
+            try:
+                manifest = load_json(manifest_path)
+            except (OSError, ValueError):
+                continue
+
+            plugin_name = manifest.get("name")
+            if not isinstance(plugin_name, str) or not plugin_name.strip():
+                plugin_name = plugin_root.name
+            plugins.append((plugin_name.strip(), plugin_dir, manifest))
+
+        if plugins:
+            marketplaces[marketplace_dir.name] = plugins
+
+    return marketplaces
+
+
+def replace_generated_dir(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def symlink_plugin(source: Path, target: Path) -> None:
+    if target.is_symlink():
+        if target.resolve() == source.resolve():
+            return
+        target.unlink()
+    elif target.exists():
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+
+    target.symlink_to(source, target_is_directory=True)
+
+
+def write_local_plugin_marketplaces(target_home: Path) -> dict[str, Path]:
+    cached_marketplaces = cached_plugin_sources()
+    if not cached_marketplaces:
+        return {}
+
+    local_roots: dict[str, Path] = {}
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    base_dir = target_home / LOCAL_MARKETPLACES_DIR
+
+    for marketplace_name, plugins in sorted(cached_marketplaces.items()):
+        marketplace_root = base_dir / marketplace_name
+        replace_generated_dir(marketplace_root)
+
+        plugins_dir = marketplace_root / "plugins"
+        agents_dir = marketplace_root / ".agents" / "plugins"
+        plugins_dir.mkdir(parents=True, exist_ok=True)
+        agents_dir.mkdir(parents=True, exist_ok=True)
+
+        entries = []
+        seen_plugin_names: set[str] = set()
+        for plugin_name, plugin_dir, manifest in plugins:
+            if plugin_name in seen_plugin_names:
+                continue
+            seen_plugin_names.add(plugin_name)
+
+            symlink_plugin(plugin_dir, plugins_dir / plugin_name)
+            interface = manifest.get("interface")
+            category = "Coding"
+            if isinstance(interface, dict) and isinstance(interface.get("category"), str):
+                category = str(interface["category"])
+
+            entries.append(
+                {
+                    "name": plugin_name,
+                    "source": {
+                        "source": "local",
+                        "path": f"./plugins/{plugin_name}",
+                    },
+                    "policy": {
+                        "installation": "AVAILABLE",
+                        "authentication": "ON_INSTALL",
+                    },
+                    "category": category,
+                }
+            )
+
+        if not entries:
+            continue
+
+        marketplace = {
+            "name": marketplace_name,
+            "interface": {
+                "displayName": MARKETPLACE_DISPLAY_NAMES.get(
+                    marketplace_name, marketplace_name
+                )
+            },
+            "plugins": entries,
+            "generatedAt": timestamp,
+        }
+        (agents_dir / "marketplace.json").write_text(
+            json.dumps(marketplace, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        local_roots[marketplace_name] = marketplace_root
+
+    return local_roots
+
+
+def upsert_local_marketplace_sections(text: str, marketplaces: dict[str, Path]) -> str:
+    if not marketplaces:
+        return text
+
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    for marketplace_name in marketplaces:
+        text = remove_named_section(text, f"marketplaces.{marketplace_name}")
+
+    sections = []
+    for marketplace_name, marketplace_root in sorted(marketplaces.items()):
+        sections.append(
+            "\n".join(
+                [
+                    f"[marketplaces.{marketplace_name}]",
+                    f'last_updated = "{timestamp}"',
+                    'source_type = "local"',
+                    f"source = {toml_string(str(marketplace_root))}",
+                ]
+            )
+        )
+
+    return text.rstrip() + "\n\n" + "\n\n".join(sections) + "\n"
+
+
 def write_thirdparty_catalog(target_home: Path) -> None:
     catalog = build_thirdparty_catalog()
     catalog_path = target_home / "model-catalogs" / "thirdparty.json"
@@ -484,7 +739,11 @@ def write_openai_catalog(target_home: Path) -> None:
     )
 
 
-def build_config(profile: str, target_home: Path) -> str:
+def build_config(
+    profile: str,
+    target_home: Path,
+    local_marketplaces: dict[str, Path] | None = None,
+) -> str:
     if not SOURCE_CONFIG_PATH.exists():
         raise RuntimeError(f"missing source config: {SOURCE_CONFIG_PATH}")
 
@@ -498,6 +757,7 @@ def build_config(profile: str, target_home: Path) -> str:
         text = upsert_top_level_value(text, "model_catalog_json", catalog_path)
         text = upsert_top_level_value(text, "service_tier", None)
         text = upsert_profile_catalog(text, catalog_path)
+        text = upsert_local_marketplace_sections(text, local_marketplaces or {})
     elif profile == "openai":
         text = upsert_top_level_value(text, "model_provider", "openai")
         text = upsert_top_level_value(text, "model", "gpt-5.4")
@@ -526,8 +786,11 @@ def main() -> int:
         ensure_shared_entry(target_home, entry)
 
     ensure_private_entry(target_home, "models_cache.json")
+    local_marketplaces = (
+        write_local_plugin_marketplaces(target_home) if profile == "thirdparty" else {}
+    )
 
-    config_text = build_config(profile, target_home)
+    config_text = build_config(profile, target_home, local_marketplaces)
     (target_home / "config.toml").write_text(config_text, encoding="utf-8")
     if profile == "thirdparty":
         ensure_shared_entry(target_home, THIRDPARTY_ENV_NAME)

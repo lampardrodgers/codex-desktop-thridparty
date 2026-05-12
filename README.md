@@ -40,12 +40,20 @@ Shareable public installer:
 ./install-codex-desktop-3p-public
 ```
 
-Use `install-codex-desktop-3p-public` when the target machine does not already have the third-party `base_url` and API key configured. This wrapper writes the provider block into `~/.codex/config.toml`, writes `~/.codex/thirdparty.env`, and then runs `install-codex-desktop-3p`.
+Use `install-codex-desktop-3p-public` when the target machine does not already have the third-party `base_url` and API key configured. This wrapper creates `~/.codex/config.toml` when needed, writes the provider block, enables `computer-use@openai-bundled` by default, writes `~/.codex/thirdparty.env`, and then runs `install-codex-desktop-3p`.
 
-Edit the two placeholder values at the top of that script before sending it to someone else:
+Edit the two placeholder values at the top of that script before sending it to someone else, or pass them at launch:
+
+```sh
+THIRDPARTY_BASE_URL="https://example.com/v1" \
+THIRDPARTY_API_KEY="sk-..." \
+./install-codex-desktop-3p-public
+```
 
 - `THIRDPARTY_BASE_URL`
 - `THIRDPARTY_API_KEY`
+
+Set `DEFAULT_ENABLED_PLUGINS` to a comma-separated plugin id list if you want a different first-run plugin set.
 
 ## Usage
 
@@ -79,7 +87,9 @@ Prerequisites on the target machine:
 - `codesign`
 - for `install-codex-desktop-3p`: working third-party provider config in `~/.codex/config.toml`
 - for `install-codex-desktop-3p`: third-party API key available through `CODEX_THIRDPARTY_API_KEY` or `~/.codex/thirdparty.env`
-- for `install-codex-desktop-3p-public`: edit `THIRDPARTY_BASE_URL` and `THIRDPARTY_API_KEY` in the script before running it
+- for `install-codex-desktop-3p-public`: edit or pass `THIRDPARTY_BASE_URL` and `THIRDPARTY_API_KEY`
+
+The installer uses the CLI bundled inside `/Applications/Codex.app`, so a separate global `codex` CLI install is not required. If the target Python lacks TOML support, the installer places `tomli` under `~/.codex/vendor/python`.
 
 ## Update behavior
 
@@ -91,6 +101,6 @@ Sparkle auto-updates are disabled for the cloned app because the 3P wrapper is r
 
 ## Log behavior
 
-`codex-app-3p` launches in the background and redirects Electron logs to:
+`codex-app-3p` writes launcher output to:
 
 `~/.codex/logs/codex-app-3p.log`

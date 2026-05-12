@@ -5,6 +5,7 @@ script_dir="${0:A:h}"
 templates_dir="$script_dir/templates"
 timestamp="$(date +%Y%m%d-%H%M%S)"
 source_app="/Applications/Codex.app"
+source_cli="$source_app/Contents/Resources/codex"
 thirdparty_cli="$HOME/.local/bin/codex-3p"
 desktop_home="$HOME/.codex/app-homes/thirdparty"
 target_app="$HOME/Applications/Codex 3P.app"
@@ -23,6 +24,11 @@ if [ ! -d "$source_app" ]; then
   exit 1
 fi
 
+if [ ! -x "$source_cli" ]; then
+  print -u2 "official Codex CLI not found at $source_cli"
+  exit 1
+fi
+
 for cmd in python3 node npx codesign; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     print -u2 "required command not found: $cmd"
@@ -31,6 +37,30 @@ for cmd in python3 node npx codesign; do
 done
 
 mkdir -p "$HOME/.codex/bin" "$HOME/.local/bin"
+
+ensure_python_toml() {
+  if python3 - <<'PY' >/dev/null 2>&1; then
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli
+PY
+    return
+  fi
+
+  mkdir -p "$HOME/.codex/vendor/python"
+  print "installing Python TOML fallback into $HOME/.codex/vendor/python"
+  python3 -m pip install --quiet --upgrade --target "$HOME/.codex/vendor/python" tomli
+
+  python3 - <<'PY' >/dev/null
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli
+PY
+}
+
+ensure_python_toml
 
 install_script() {
   local src="$1"
@@ -67,7 +97,7 @@ fi
 
 mkdir -p "$log_dir"
 "$sync_home" thirdparty "$desktop_home"
-CODEX_HOME="$desktop_home" CODEX_FORCE_MODEL_CATALOG=1 "$thirdparty_cli" --version >"$log_file" 2>&1
+CODEX_REAL_CLI_PATH="$source_cli" CODEX_HOME="$desktop_home" CODEX_FORCE_MODEL_CATALOG=1 "$thirdparty_cli" --version >"$log_file" 2>&1
 "$prepare_app" "$source_app" "$target_app" >/dev/null
 defaults write com.openai.codex.thirdparty SUEnableAutomaticChecks -bool false >/dev/null 2>&1 || true
 defaults write com.openai.codex.thirdparty SUAutomaticallyUpdate -bool false >/dev/null 2>&1 || true

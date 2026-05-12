@@ -11,7 +11,7 @@ import tempfile
 from pathlib import Path
 
 
-PATCH_REVISION = "20260421.1"
+PATCH_REVISION = "20260512.4"
 HOME_DIR = Path.home()
 THIRDPARTY_CODEX_HOME = str(HOME_DIR / ".codex" / "app-homes" / "thirdparty")
 THIRDPARTY_CLI_PATH = str(HOME_DIR / ".local" / "bin" / "codex-3p")
@@ -125,6 +125,39 @@ def replace_pattern_once(
     return updated
 
 
+def find_asset_by_markers(
+    assets_dir: Path,
+    preferred_globs: list[str],
+    markers: list[str],
+    description: str,
+) -> Path:
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    for pattern in preferred_globs:
+        for path in sorted(assets_dir.glob(pattern)):
+            if path not in seen:
+                candidates.append(path)
+                seen.add(path)
+
+    for path in sorted(assets_dir.glob("*.js")):
+        if path not in seen:
+            candidates.append(path)
+            seen.add(path)
+
+    for path in candidates:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        if all(marker in text for marker in markers):
+            return path
+
+    raise RuntimeError(
+        f"could not find {description} bundle in {assets_dir}; "
+        f"searched {', '.join(preferred_globs)} and *.js"
+    )
+
+
 def patch_font_settings(font_path: Path) -> None:
     text = font_path.read_text(encoding="utf-8")
     helper_block = (
@@ -157,95 +190,200 @@ def patch_font_settings(font_path: Path) -> None:
         description="models/list query builder",
         marker="__codexThirdpartyVisibleModel=`gpt-5.3-codex-spark`",
     )
-    text = replace_pattern_once(
-        text,
-        r"(?P<loader>\w+)=\(\)=>(?P<fetch>\w+)\(`list-models-for-host`,\{hostId:(?P<host>\w+),includeHidden:!0,cursor:null,limit:(?P<limit>\w+)\}\)",
-        lambda match: (
-            match.group("loader")
-            + "=()=>"
-            + match.group("fetch")
-            + "(`list-models-for-host`,{hostId:"
-            + match.group("host")
-            + ",includeHidden:!0,cursor:null,limit:"
-            + match.group("limit")
-            + "}).then(e=>{let t=e??{};return{...t,data:__codexEnsureThirdpartyModels(t.data)}})"
-        ),
-        font_path,
-        description="list-models-for-host loader",
-        marker="data:__codexEnsureThirdpartyModels(t.data)",
-    )
-    text = replace_pattern_once(
-        text,
-        r"let\{data:(?P<data>\w+)\}=e,(?P<models>\w+)=\{models:\[\]\},(?P<default>\w+)=null;return (?P=data)\.forEach\(e=>\{",
-        lambda match: (
-            "let{data:"
-            + match.group("data")
-            + "}=e,"
-            + match.group("models")
-            + "={models:[]},"
-            + match.group("default")
-            + "=null,__codexThirdpartyModels=__codexEnsureThirdpartyModels("
-            + match.group("data")
-            + ");return __codexThirdpartyModels.forEach(e=>{"
-        ),
-        font_path,
-        description="model list selector",
-        marker="__codexThirdpartyModels=__codexEnsureThirdpartyModels(",
-    )
-    text = replace_pattern_once(
-        text,
-        r"if\((?P<config>\w+)\.useHiddenModels\?(?P=config)\.availableModels\.has\(e\.model\):!e\.hidden\)\{",
-        lambda match: (
-            "if("
-            + match.group("config")
-            + ".useHiddenModels?"
-            + match.group("config")
-            + ".availableModels.has(e.model)||e.model===__codexThirdpartyVisibleModel:!e.hidden||e.model===__codexThirdpartyVisibleModel){"
-        ),
-        font_path,
-        description="hidden model filter",
-        marker="availableModels.has(e.model)||e.model===__codexThirdpartyVisibleModel",
-    )
-    text = replace_pattern_once(
-        text,
-        r"function (?P<gate>\w+)\(e\)\{return e===`chatgpt`\}",
-        lambda match: f"function {match.group('gate')}(e){{return!0}}",
-        font_path,
-        description="fast mode auth gate",
-        marker="return!0}function Qe(){",
-    )
+    try:
+        text = replace_pattern_once(
+            text,
+            r"(?P<loader>\w+)=\(\)=>(?P<fetch>\w+)\(`list-models-for-host`,\{hostId:(?P<host>\w+),includeHidden:!0,cursor:null,limit:(?P<limit>\w+)\}\)",
+            lambda match: (
+                match.group("loader")
+                + "=()=>"
+                + match.group("fetch")
+                + "(`list-models-for-host`,{hostId:"
+                + match.group("host")
+                + ",includeHidden:!0,cursor:null,limit:"
+                + match.group("limit")
+                + "}).then(e=>{let t=e??{};return{...t,data:__codexEnsureThirdpartyModels(t.data)}})"
+            ),
+            font_path,
+            description="list-models-for-host loader",
+            marker="data:__codexEnsureThirdpartyModels(t.data)",
+        )
+    except RuntimeError:
+        text = replace_pattern_once(
+            text,
+            r"queryFn:\(\)=>(?P<fetch>\w+)\(`list-models-for-host`,\{hostId:(?P<host>\w+),includeHidden:!0,cursor:null,limit:(?P<limit>\w+)\}\)",
+            lambda match: (
+                "queryFn:()=>"
+                + match.group("fetch")
+                + "(`list-models-for-host`,{hostId:"
+                + match.group("host")
+                + ",includeHidden:!0,cursor:null,limit:"
+                + match.group("limit")
+                + "}).then(e=>{let t=e??{};return{...t,data:__codexEnsureThirdpartyModels(t.data)}})"
+            ),
+            font_path,
+            description="list-models-for-host loader",
+            marker="data:__codexEnsureThirdpartyModels(t.data)",
+        )
+    try:
+        text = replace_pattern_once(
+            text,
+            r"let\{data:(?P<data>\w+)\}=e,(?P<models>\w+)=\{models:\[\]\},(?P<default>\w+)=null;return (?P=data)\.forEach\(e=>\{",
+            lambda match: (
+                "let{data:"
+                + match.group("data")
+                + "}=e,"
+                + match.group("models")
+                + "={models:[]},"
+                + match.group("default")
+                + "=null,__codexThirdpartyModels=__codexEnsureThirdpartyModels("
+                + match.group("data")
+                + ");return __codexThirdpartyModels.forEach(e=>{"
+            ),
+            font_path,
+            description="model list selector",
+            marker="__codexThirdpartyModels=__codexEnsureThirdpartyModels(",
+        )
+    except RuntimeError:
+        text = replace_pattern_once(
+            text,
+            r"select:\(\{data:(?P<data>\w+)\}\)=>\{let (?P<models>\w+)=\[\],(?P<available>\w+)=new Set\((?P<available_source>\w+)\),(?P<default>\w+)=null;return (?P=data)\.forEach\(e=>\{",
+            lambda match: (
+                "select:({data:"
+                + match.group("data")
+                + "})=>{let "
+                + match.group("models")
+                + "=[],"
+                + match.group("available")
+                + "=new Set("
+                + match.group("available_source")
+                + "),"
+                + match.group("default")
+                + "=null,__codexThirdpartyModels=__codexEnsureThirdpartyModels("
+                + match.group("data")
+                + ");return __codexThirdpartyModels.forEach(e=>{"
+            ),
+            font_path,
+            description="model list selector",
+            marker="__codexThirdpartyModels=__codexEnsureThirdpartyModels(",
+        )
+    try:
+        text = replace_pattern_once(
+            text,
+            r"if\((?P<config>\w+)\.useHiddenModels\?(?P=config)\.availableModels\.has\(e\.model\):!e\.hidden\)\{",
+            lambda match: (
+                "if("
+                + match.group("config")
+                + ".useHiddenModels?"
+                + match.group("config")
+                + ".availableModels.has(e.model)||e.model===__codexThirdpartyVisibleModel:!e.hidden||e.model===__codexThirdpartyVisibleModel){"
+            ),
+            font_path,
+            description="hidden model filter",
+            marker="e.model===__codexThirdpartyVisibleModel:!e.hidden",
+        )
+    except RuntimeError:
+        text = replace_pattern_once(
+            text,
+            r"if\((?P<allowlist>\w+)\?(?P<available>\w+)\.has\(e\.model\):!e\.hidden\)\{",
+            lambda match: (
+                "if("
+                + match.group("allowlist")
+                + "?"
+                + match.group("available")
+                + ".has(e.model)||e.model===__codexThirdpartyVisibleModel:!e.hidden||e.model===__codexThirdpartyVisibleModel){"
+            ),
+            font_path,
+            description="hidden model filter",
+            marker="e.model===__codexThirdpartyVisibleModel:!e.hidden",
+        )
+    try:
+        text = replace_pattern_once(
+            text,
+            r"function (?P<gate>\w+)\(e\)\{return e===`chatgpt`\}",
+            lambda match: f"function {match.group('gate')}(e){{return!0}}",
+            font_path,
+            description="fast mode auth gate",
+            marker="return!0}function Qe(){",
+        )
+    except RuntimeError:
+        pass
 
     font_path.write_text(text, encoding="utf-8")
 
 
 def patch_bootstrap(bootstrap_path: Path) -> None:
     text = bootstrap_path.read_text(encoding="utf-8")
-    text = replace_pattern_once(
-        text,
-        r"var y=process\.platform===`darwin`,b=e\.(?P<resolver>\w+)\.resolve\(\);(?P<macos_call>e\.\w+\(y\),)?t\.app\.setName\(e\.\w+\(b\)\),t\.app\.setPath\(`userData`,g\(\{appDataPath:t\.app\.getPath\(`appData`\),buildFlavor:b,env:process\.env\}\)\),process\.platform===`win32`&&t\.app\.setAppUserModelId\(e\.(?P<app_id>\w+)\(b\)\);",
-        lambda match: (
-            "var y=process.platform===`darwin`,b=e."
-            + match.group("resolver")
-            + ".resolve();"
-            + (match.group("macos_call") or "")
-            + "__codexThirdpartyDefaults={CODEX_HOME:`"
-            + THIRDPARTY_CODEX_HOME
-            + "`,CODEX_CLI_PATH:`"
-            + THIRDPARTY_CLI_PATH
-            + "`,CODEX_ELECTRON_APP_NAME:`"
-            + THIRDPARTY_APP_NAME
-            + "`,CODEX_ELECTRON_USER_DATA_PATH:`"
-            + THIRDPARTY_USER_DATA_PATH
-            + "`,CODEX_FORCE_MODEL_CATALOG:`1`};for(let[e,t]of Object.entries(__codexThirdpartyDefaults)){let n=process.env[e]?.trim();n&&n.length>0||(process.env[e]=t)}var S=process.env.CODEX_ELECTRON_APP_NAME?.trim()||`"
-            + THIRDPARTY_APP_NAME
-            + "`;t.app.setName(S),t.app.setPath(`userData`,g({appDataPath:t.app.getPath(`appData`),buildFlavor:b,env:process.env})),process.platform===`win32`&&t.app.setAppUserModelId(e."
-            + match.group("app_id")
-            + "(b));"
-        ),
-        bootstrap_path,
-        description="desktop bootstrap app naming block",
-        marker="__codexThirdpartyDefaults={CODEX_HOME:`",
-    )
+    try:
+        text = replace_pattern_once(
+            text,
+            r"var y=process\.platform===`darwin`,b=e\.(?P<resolver>\w+)\.resolve\(\);(?P<macos_call>e\.\w+\(y\),)?t\.app\.setName\(e\.\w+\(b\)\),t\.app\.setPath\(`userData`,g\(\{appDataPath:t\.app\.getPath\(`appData`\),buildFlavor:b,env:process\.env\}\)\),process\.platform===`win32`&&t\.app\.setAppUserModelId\(e\.(?P<app_id>\w+)\(b\)\);",
+            lambda match: (
+                "var y=process.platform===`darwin`,b=e."
+                + match.group("resolver")
+                + ".resolve();"
+                + (match.group("macos_call") or "")
+                + "__codexThirdpartyDefaults={CODEX_HOME:`"
+                + THIRDPARTY_CODEX_HOME
+                + "`,CODEX_CLI_PATH:`"
+                + THIRDPARTY_CLI_PATH
+                + "`,CODEX_ELECTRON_APP_NAME:`"
+                + THIRDPARTY_APP_NAME
+                + "`,CODEX_ELECTRON_USER_DATA_PATH:`"
+                + THIRDPARTY_USER_DATA_PATH
+                + "`,CODEX_FORCE_MODEL_CATALOG:`1`};for(let[e,t]of Object.entries(__codexThirdpartyDefaults)){let n=process.env[e]?.trim();n&&n.length>0||(process.env[e]=t)}var S=process.env.CODEX_ELECTRON_APP_NAME?.trim()||`"
+                + THIRDPARTY_APP_NAME
+                + "`;t.app.setName(S),t.app.setPath(`userData`,g({appDataPath:t.app.getPath(`appData`),buildFlavor:b,env:process.env})),process.platform===`win32`&&t.app.setAppUserModelId(e."
+                + match.group("app_id")
+                + "(b));"
+            ),
+            bootstrap_path,
+            description="desktop bootstrap app naming block",
+            marker="__codexThirdpartyDefaults={CODEX_HOME:`",
+        )
+    except RuntimeError:
+        text = replace_pattern_once(
+            text,
+            r"var (?P<darwin>\w+)=process\.platform===`darwin`,(?P<flavor>\w+)=(?P<resolver>[\w.]+)\.resolve\(\);(?P<prefix>[\s\S]*?)(?P<electron>\w+)\.app\.setName\((?P<name_expr>.*?)\),(?P=electron)\.app\.setPath\(`userData`,(?P<user_data_fn>\w+)\(\{appDataPath:(?P=electron)\.app\.getPath\(`appData`\),buildFlavor:(?P=flavor),env:process\.env\}\)\),process\.platform===`win32`&&(?P=electron)\.app\.setAppUserModelId\((?P<app_id_expr>.*?)\);",
+            lambda match: (
+                "var "
+                + match.group("darwin")
+                + "=process.platform===`darwin`,"
+                + match.group("flavor")
+                + "="
+                + match.group("resolver")
+                + ".resolve();"
+                + match.group("prefix")
+                + "__codexThirdpartyDefaults={CODEX_HOME:`"
+                + THIRDPARTY_CODEX_HOME
+                + "`,CODEX_CLI_PATH:`"
+                + THIRDPARTY_CLI_PATH
+                + "`,CODEX_ELECTRON_APP_NAME:`"
+                + THIRDPARTY_APP_NAME
+                + "`,CODEX_ELECTRON_USER_DATA_PATH:`"
+                + THIRDPARTY_USER_DATA_PATH
+                + "`,CODEX_FORCE_MODEL_CATALOG:`1`};for(let[e,t]of Object.entries(__codexThirdpartyDefaults)){let n=process.env[e]?.trim();n&&n.length>0||(process.env[e]=t)}var S=process.env.CODEX_ELECTRON_APP_NAME?.trim()||`"
+                + THIRDPARTY_APP_NAME
+                + "`;"
+                + match.group("electron")
+                + ".app.setName(S),"
+                + match.group("electron")
+                + ".app.setPath(`userData`,"
+                + match.group("user_data_fn")
+                + "({appDataPath:"
+                + match.group("electron")
+                + ".app.getPath(`appData`),buildFlavor:"
+                + match.group("flavor")
+                + ",env:process.env})),process.platform===`win32`&&"
+                + match.group("electron")
+                + ".app.setAppUserModelId("
+                + match.group("app_id_expr")
+                + ");"
+            ),
+            bootstrap_path,
+            description="desktop bootstrap app naming block",
+            marker="__codexThirdpartyDefaults={CODEX_HOME:`",
+        )
 
     bootstrap_path.write_text(text, encoding="utf-8")
 
@@ -264,9 +402,161 @@ def patch_index_bundle(index_path: Path) -> None:
     ]
 
     for old, new in replacements:
-        text = replace_literal_once(text, old, new, index_path)
+        if old in text or new in text:
+            text = replace_literal_once(text, old, new, index_path)
 
     index_path.write_text(text, encoding="utf-8")
+
+
+def patch_composer_bundle(composer_path: Path) -> None:
+    text = composer_path.read_text(encoding="utf-8")
+    text = replace_pattern_once(
+        text,
+        r"let (?P<enabled>\w+)=(?P<requires_auth>\w+)&&(?P<ready>\w+)&&(?P<status>\w+)!==`error`&&\((?P<models>\w+)\?\.models\.length\?\?0\)>0,(?P<deps>\w+);",
+        lambda match: (
+            "let "
+            + match.group("enabled")
+            + "="
+            + match.group("ready")
+            + "&&"
+            + match.group("status")
+            + "!==`error`&&("
+            + match.group("models")
+            + "?.models.length??0)>0,"
+            + match.group("deps")
+            + ";"
+        ),
+        composer_path,
+        description="model slash command auth gate",
+        marker=None,
+    )
+    text = replace_pattern_once(
+        text,
+        r"let (?P<enabled>\w+)=(?P<requires_auth>\w+)&&(?P<ready>\w+)&&!(?P<blocked>\w+),(?P<deps>\w+);(?P<tail>(?P<cache>\w+)\[\d+\]!==(?P<models>\w+)\|\|(?P=cache)\[\d+\]!==(?P<conversation>\w+)\|\|(?P=cache)\[\d+\]!==(?P=ready))",
+        lambda match: (
+            "let "
+            + match.group("enabled")
+            + "="
+            + match.group("ready")
+            + "&&!"
+            + match.group("blocked")
+            + ","
+            + match.group("deps")
+            + ";"
+            + match.group("tail")
+        ),
+        composer_path,
+        description="reasoning slash command auth gate",
+        marker="let w=f&&!p,T;t[20]",
+    )
+    text = replace_pattern_once(
+        text,
+        r"let (?P<enabled>\w+)=(?P<gate>\w+)\((?P<host>\w+)\),\{serviceTierSettings:(?P<settings>\w+),setServiceTier:(?P<setter>\w+)\}=(?P<hook>\w+)\(\),(?P<current>\w+);",
+        lambda match: (
+            "let "
+            + match.group("enabled")
+            + "=!0,{serviceTierSettings:"
+            + match.group("settings")
+            + ",setServiceTier:"
+            + match.group("setter")
+            + "}="
+            + match.group("hook")
+            + "(),"
+            + match.group("current")
+            + ";"
+        ),
+        composer_path,
+        description="speed slash command auth gate",
+        marker="let a=!0,{serviceTierSettings:",
+    )
+    text = replace_pattern_once(
+        text,
+        r"(?P<cloud>\w+)=\((?P<has_git>\w+)\|\|!1\)&&(?P<access>\w+)===`enabled`,(?P<worktree>\w+)=(?P=has_git)&&(?P<allow>\w+)&&(?P<flag>\w+),\[(?P<env>\w+),(?P<set_env>\w+)\]=",
+        lambda match: (
+            match.group("cloud")
+            + "=("
+            + match.group("has_git")
+            + "||!1)&&"
+            + match.group("access")
+            + "===`enabled`,"
+            + match.group("worktree")
+            + "="
+            + match.group("has_git")
+            + "&&"
+            + match.group("allow")
+            + ",["
+            + match.group("env")
+            + ","
+            + match.group("set_env")
+            + "]="
+        ),
+        composer_path,
+        description="worktree slash command feature gate",
+        marker="B=L&&m,[V,H]=",
+    )
+    composer_path.write_text(text, encoding="utf-8")
+
+
+def patch_plugin_auth_gate(auth_gate_path: Path) -> None:
+    text = auth_gate_path.read_text(encoding="utf-8")
+    text = replace_pattern_once(
+        text,
+        r"function (?P<gate>\w+)\((?P<arg>\w+)\)\{return (?P=arg)!==`chatgpt`\}",
+        lambda match: (
+            "function "
+            + match.group("gate")
+            + "("
+            + match.group("arg")
+            + "){return!1}"
+        ),
+        auth_gate_path,
+        description="plugin ChatGPT auth availability gate",
+        marker="return!1}var ",
+    )
+    auth_gate_path.write_text(text, encoding="utf-8")
+
+
+def patch_skills_page(skills_page_path: Path) -> None:
+    text = skills_page_path.read_text(encoding="utf-8")
+    text = replace_pattern_once(
+        text,
+        r"\(0,(?P<react>\w+)\.useEffect\)\((?P<effect>\w+),(?P<deps>\w+)\),(?P<available>\w+)&&!?(?P<chatgpt>\w+)\)\{let (?P<blocked>\w+);return (?P<cache>\w+)\[8\]===Symbol\.for\(`react\.memo_cache_sentinel`\)\?\((?P=blocked)=\(0,(?P<jsx>\w+)\.jsx\)\((?P<component>\w+),\{\}\),(?P=cache)\[8\]=(?P=blocked)\):(?P=blocked)=(?P=cache)\[8\],(?P=blocked)\}let (?P<page>\w+);return",
+        lambda match: (
+            "(0,"
+            + match.group("react")
+            + ".useEffect)("
+            + match.group("effect")
+            + ","
+            + match.group("deps")
+            + "),!1){let "
+            + match.group("blocked")
+            + ";return "
+            + match.group("cache")
+            + "[8]===Symbol.for(`react.memo_cache_sentinel`)?("
+            + match.group("blocked")
+            + "=(0,"
+            + match.group("jsx")
+            + ".jsx)("
+            + match.group("component")
+            + ",{}),"
+            + match.group("cache")
+            + "[8]="
+            + match.group("blocked")
+            + "):"
+            + match.group("blocked")
+            + "="
+            + match.group("cache")
+            + "[8],"
+            + match.group("blocked")
+            + "}let "
+            + match.group("page")
+            + ";return"
+        ),
+        skills_page_path,
+        description="plugin page ChatGPT auth gate",
+        marker="),!1){let ",
+    )
+    skills_page_path.write_text(text, encoding="utf-8")
 
 
 def prepare_clone(source_app: Path, target_app: Path) -> Path:
@@ -310,9 +600,39 @@ def prepare_clone(source_app: Path, target_app: Path) -> Path:
         extracted = temp_root / "extracted"
         patched_asar = temp_root / "app.asar"
         subprocess.run(["npx", "--yes", "asar", "extract", str(target_asar), str(extracted)], check=True)
-        font_path = next((extracted / "webview" / "assets").glob("font-settings-*.js"))
+        assets_dir = extracted / "webview" / "assets"
+        font_path = find_asset_by_markers(
+            assets_dir,
+            ["font-settings-*.js", "model-queries-*.js"],
+            ["[`models`,`list`", "list-models-for-host"],
+            "model query",
+        )
         patch_font_settings(font_path)
-        patch_index_bundle(next((extracted / "webview" / "assets").glob("index-*.js")))
+        patch_index_bundle(next(assets_dir.glob("index-*.js")))
+        patch_composer_bundle(
+            find_asset_by_markers(
+                assets_dir,
+                ["composer-*.js"],
+                ["composer.modelSlashCommand.title", "composer.reasoningSlashCommand.title"],
+                "composer slash commands",
+            )
+        )
+        patch_plugin_auth_gate(
+            find_asset_by_markers(
+                assets_dir,
+                ["gradient-*.js"],
+                ["new URL(`gradient-", "export{"],
+                "plugin auth gate",
+            )
+        )
+        patch_skills_page(
+            find_asset_by_markers(
+                assets_dir,
+                ["skills-page-*.js"],
+                ["pluginsAuthBlockedToast", "pluginDeepLinkAuthBlocked"],
+                "skills page",
+            )
+        )
         patch_bootstrap(extracted / ".vite" / "build" / "bootstrap.js")
         subprocess.run(["npx", "--yes", "asar", "pack", str(extracted), str(patched_asar)], check=True)
         shutil.copy2(patched_asar, target_asar)

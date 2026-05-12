@@ -4,6 +4,10 @@ import os
 import shutil
 import sys
 
+vendor_python = os.path.expanduser("~/.codex/vendor/python")
+if os.path.isdir(vendor_python) and vendor_python not in sys.path:
+    sys.path.insert(0, vendor_python)
+
 
 if sys.version_info < (3, 11):
     candidate_pythons = [
@@ -31,6 +35,74 @@ except ModuleNotFoundError:
     import tomli as tomllib
 
 
+DEFAULT_REASONING_LEVELS = [
+    {"effort": "low", "description": "Fast responses with lighter reasoning"},
+    {"effort": "medium", "description": "Balances speed and reasoning depth for everyday tasks"},
+    {"effort": "high", "description": "Greater reasoning depth for complex problems"},
+    {"effort": "xhigh", "description": "Extra high reasoning depth for complex problems"},
+]
+DEFAULT_MODEL_TEMPLATES = [
+    {
+        "slug": "gpt-5.4",
+        "display_name": "gpt-5.4",
+        "description": "Strong model for everyday coding.",
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": DEFAULT_REASONING_LEVELS,
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": True,
+        "priority": 10,
+        "additional_speed_tiers": ["fast"],
+    },
+    {
+        "slug": "gpt-5.4-mini",
+        "display_name": "gpt-5.4-mini",
+        "description": "Small, fast, and cost-efficient model for simpler coding tasks.",
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": DEFAULT_REASONING_LEVELS,
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": True,
+        "priority": 20,
+        "additional_speed_tiers": ["fast"],
+    },
+    {
+        "slug": "gpt-5.3-codex",
+        "display_name": "gpt-5.3-codex",
+        "description": "Coding-optimized model.",
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": DEFAULT_REASONING_LEVELS,
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": True,
+        "priority": 30,
+        "additional_speed_tiers": ["fast"],
+    },
+    {
+        "slug": "gpt-5.3-codex-spark",
+        "display_name": "gpt-5.3-codex-spark",
+        "description": "Ultra-fast coding model.",
+        "default_reasoning_level": "high",
+        "supported_reasoning_levels": DEFAULT_REASONING_LEVELS,
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": True,
+        "priority": 40,
+        "additional_speed_tiers": ["fast"],
+    },
+    {
+        "slug": "gpt-5.2",
+        "display_name": "gpt-5.2",
+        "description": "Optimized for professional work and long-running agents.",
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": DEFAULT_REASONING_LEVELS,
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": True,
+        "priority": 50,
+        "additional_speed_tiers": ["fast"],
+    },
+]
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
 CONFIG_PATH = CODEX_HOME / "config.toml"
 MODELS_CACHE_PATH = CODEX_HOME / "models_cache.json"
@@ -56,6 +128,10 @@ def resolve_real_codex() -> Path:
         Path(os.environ.get("CODEX_REAL_CLI_PATH", "")).expanduser()
         if os.environ.get("CODEX_REAL_CLI_PATH")
         else None,
+        Path(os.environ.get("CODEX_APP_CLI_PATH", "")).expanduser()
+        if os.environ.get("CODEX_APP_CLI_PATH")
+        else None,
+        Path("/Applications/Codex.app/Contents/Resources/codex"),
         Path.home() / ".npm-global" / "bin" / "codex",
         Path("/opt/homebrew/bin/codex"),
         Path("/usr/local/bin/codex"),
@@ -176,14 +252,15 @@ def fetch_provider_model_ids(base_url: str, api_key: str) -> list[str]:
 
 def load_cached_models() -> dict[str, dict]:
     if not MODELS_CACHE_PATH.exists():
-        return {}
+        return {model["slug"]: copy.deepcopy(model) for model in DEFAULT_MODEL_TEMPLATES}
     cache = load_json(MODELS_CACHE_PATH)
     models = cache.get("models", [])
-    return {
+    cached = {
         model["slug"]: model
         for model in models
         if isinstance(model, dict) and model.get("slug")
     }
+    return cached or {model["slug"]: copy.deepcopy(model) for model in DEFAULT_MODEL_TEMPLATES}
 
 
 def load_models_cache_document() -> dict:

@@ -1,9 +1,11 @@
 #!/bin/zsh
 set -euo pipefail
 
-# Fill these two values before sharing/running this installer.
-THIRDPARTY_BASE_URL="YOUR-THIRDPARTY-BASE-URL"
-THIRDPARTY_API_KEY="YOUR-THIRDPARTY-API-KEY"
+# Fill these two values before sharing/running this installer, or pass them as
+# environment variables when invoking the script.
+THIRDPARTY_BASE_URL="${THIRDPARTY_BASE_URL:-YOUR-THIRDPARTY-BASE-URL}"
+THIRDPARTY_API_KEY="${THIRDPARTY_API_KEY:-YOUR-THIRDPARTY-API-KEY}"
+DEFAULT_ENABLED_PLUGINS="${DEFAULT_ENABLED_PLUGINS:-computer-use@openai-bundled}"
 
 script_dir="${0:A:h}"
 base_installer="$script_dir/install-codex-desktop-3p"
@@ -28,12 +30,6 @@ if [ ! -d "/Applications/Codex.app" ]; then
   exit 1
 fi
 
-if [ ! -f "$config_path" ]; then
-  print -u2 "missing $config_path"
-  print -u2 "Launch the official Codex app once before running this installer."
-  exit 1
-fi
-
 for cmd in python3; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     print -u2 "required command not found: $cmd"
@@ -44,7 +40,12 @@ done
 mkdir -p "$codex_home"
 chmod 700 "$codex_home"
 
-CONFIG_PATH="$config_path" THIRDPARTY_BASE_URL="$THIRDPARTY_BASE_URL" python3 <<'PY'
+CONFIG_PATH="$config_path" \
+ENV_PATH="$env_path" \
+THIRDPARTY_BASE_URL="$THIRDPARTY_BASE_URL" \
+THIRDPARTY_API_KEY="$THIRDPARTY_API_KEY" \
+DEFAULT_ENABLED_PLUGINS="$DEFAULT_ENABLED_PLUGINS" \
+python3 <<'PY'
 import json
 import os
 import re
@@ -52,9 +53,20 @@ from pathlib import Path
 
 
 config_path = Path(os.environ["CONFIG_PATH"]).expanduser()
+env_path = Path(os.environ["ENV_PATH"]).expanduser()
 base_url = os.environ["THIRDPARTY_BASE_URL"].strip()
+api_key = os.environ["THIRDPARTY_API_KEY"].strip()
+enabled_plugins = [
+    item.strip()
+    for item in re.split(r"[,\s]+", os.environ.get("DEFAULT_ENABLED_PLUGINS", ""))
+    if item.strip()
+]
 if not base_url:
     raise SystemExit("THIRDPARTY_BASE_URL is empty")
+if not api_key:
+    raise SystemExit("THIRDPARTY_API_KEY is empty")
+if "\n" in api_key or "\r" in api_key:
+    raise SystemExit("THIRDPARTY_API_KEY must be a single-line value")
 
 block = "\n".join(
     [
@@ -66,7 +78,10 @@ block = "\n".join(
     ]
 )
 
-text = config_path.read_text(encoding="utf-8")
+if config_path.exists():
+    text = config_path.read_text(encoding="utf-8")
+else:
+    text = 'model_provider = "openai"\nmodel = "gpt-5.4"\n'
 pattern = r"(?ms)^\[model_providers\.thirdparty\]\n.*?(?=^\[|\Z)"
 replacement = block + "\n"
 
@@ -79,13 +94,36 @@ else:
         text += "\n"
     text += replacement
 
-config_path.write_text(text, encoding="utf-8")
-PY
+for plugin_id in enabled_plugins:
+    if not re.match(r"^[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+$", plugin_id):
+        raise SystemExit(f"invalid plugin id in DEFAULT_ENABLED_PLUGINS: {plugin_id}")
 
-cat > "$env_path" <<EOF
-# Third-party desktop credentials for codex-app-3p / codex-3p
-CODEX_THIRDPARTY_API_KEY=$THIRDPARTY_API_KEY
-EOF
+    plugin_block = "\n".join(
+        [
+            f"[plugins.{json.dumps(plugin_id)}]",
+            "enabled = true",
+        ]
+    )
+    plugin_pattern = rf"(?ms)^\[plugins\.{re.escape(json.dumps(plugin_id))}\]\n.*?(?=^\[|\Z)"
+    plugin_replacement = plugin_block + "\n"
+    if re.search(plugin_pattern, text):
+        text = re.sub(plugin_pattern, plugin_replacement, text)
+    else:
+        text = text.rstrip() + "\n\n" + plugin_replacement
+
+config_path.write_text(text, encoding="utf-8")
+
+env_path.write_text(
+    "\n".join(
+        [
+            "# Third-party desktop credentials for codex-app-3p / codex-3p",
+            f"CODEX_THIRDPARTY_API_KEY={api_key}",
+            "",
+        ]
+    ),
+    encoding="utf-8",
+)
+PY
 chmod 600 "$env_path"
 
 exec "$base_installer"

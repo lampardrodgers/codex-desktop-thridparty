@@ -3,11 +3,18 @@
 import json
 import os
 import plistlib
+import re
+import socket
 import subprocess
 import sys
 import time
+import tempfile
 import urllib.request
 from pathlib import Path
+
+vendor_python = Path.home() / ".codex" / "vendor" / "python"
+if vendor_python.is_dir() and str(vendor_python) not in sys.path:
+    sys.path.insert(0, str(vendor_python))
 
 try:
     import tomllib
@@ -89,6 +96,20 @@ def provider_base_url() -> str | None:
     return None
 
 
+def enabled_plugin_ids(config: dict) -> list[str]:
+    plugins = config.get("plugins", {})
+    if not isinstance(plugins, dict):
+        return []
+
+    enabled: list[str] = []
+    for plugin_id, plugin_config in plugins.items():
+        if not isinstance(plugin_id, str) or not isinstance(plugin_config, dict):
+            continue
+        if plugin_config.get("enabled") is True:
+            enabled.append(plugin_id)
+    return sorted(enabled)
+
+
 def masked_token(token: str) -> str:
     if len(token) <= 8:
         return "*" * len(token)
@@ -117,6 +138,74 @@ def check_codesign(app_path: Path) -> bool:
         text=True,
     )
     return result.returncode == 0
+
+
+def cloned_app_plugin_gate_summary(app_path: Path) -> tuple[bool, list[str]]:
+    asar_path = app_path / "Contents" / "Resources" / "app.asar"
+    if not asar_path.exists():
+        return False, [f"missing app.asar: {asar_path}"]
+
+    issues: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="codex-3p-check-") as temp_dir:
+        extracted = Path(temp_dir) / "asar"
+        result = subprocess.run(
+            ["npx", "--yes", "asar", "extract", str(asar_path), str(extracted)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            details = result.stderr.strip() or result.stdout.strip() or "asar extract failed"
+            return False, [details]
+
+        assets_dir = extracted / "webview" / "assets"
+        gradient_assets = sorted(assets_dir.glob("gradient-*.js"))
+        gate_assets = [
+            path
+            for path in gradient_assets
+            if "new URL(`gradient-" in path.read_text(encoding="utf-8")
+        ]
+        if not gate_assets:
+            issues.append("plugin auth gate asset not found")
+        else:
+            gate_text = gate_assets[0].read_text(encoding="utf-8")
+            if "return!1}var " not in gate_text:
+                issues.append(f"plugin auth gate is not bypassed: {gate_assets[0].name}")
+
+        skills_assets = sorted(assets_dir.glob("skills-page-*.js"))
+        blocked_skills_assets = []
+        for path in skills_assets:
+            text = path.read_text(encoding="utf-8")
+            if "pluginsAuthBlockedToast" in text and "),!1){let " not in text:
+                blocked_skills_assets.append(path.name)
+        if blocked_skills_assets:
+            issues.append(
+                "skills page still contains active plugin auth block: "
+                + ", ".join(blocked_skills_assets)
+            )
+
+        composer_assets = sorted(assets_dir.glob("composer-*.js"))
+        command_assets = [
+            path
+            for path in composer_assets
+            if "composer.modelSlashCommand.title" in path.read_text(encoding="utf-8")
+            and "composer.reasoningSlashCommand.title" in path.read_text(encoding="utf-8")
+        ]
+        if not command_assets:
+            issues.append("composer slash command asset not found")
+        else:
+            command_text = command_assets[0].read_text(encoding="utf-8")
+            slash_gate_checks = {
+                "model slash command still requires auth": r"let \w+=\w+&&\w+&&\w+!==`error`&&\(\w+\?\.models\.length\?\?0\)>0,\w+;",
+                "reasoning slash command still requires auth": r"let \w+=\w+&&\w+&&!\w+,\w+;",
+                "speed slash command still uses auth gate": r"let \w+=\w+\(\w+\),\{serviceTierSettings:",
+                "worktree slash command still uses feature flag": r"\w+=\w+&&\w+&&\w+,\[\w+,\w+\]=",
+            }
+            for message, pattern in slash_gate_checks.items():
+                if re.search(pattern, command_text):
+                    issues.append(f"{message}: {command_assets[0].name}")
+
+    return not issues, issues
 
 
 def request_models(base_url: str, token: str) -> list[str]:
@@ -152,14 +241,21 @@ def model_catalog_entries(path: Path) -> list[dict]:
     return [item for item in items if isinstance(item, dict)]
 
 
+def pick_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as handle:
+        handle.bind(("127.0.0.1", 0))
+        return int(handle.getsockname()[1])
+
+
 def runtime_model_ids(codex_home: Path, extra_env: dict[str, str] | None = None) -> list[str]:
     env = os.environ.copy()
     env["CODEX_HOME"] = str(codex_home)
     if extra_env:
         env.update(extra_env)
 
+    port = pick_free_port()
     server = subprocess.Popen(
-        [str(CODEX_CLI), "app-server", "--listen", "ws://127.0.0.1:8896"],
+        [str(CODEX_CLI), "app-server", "--listen", f"ws://127.0.0.1:{port}"],
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -167,7 +263,7 @@ def runtime_model_ids(codex_home: Path, extra_env: dict[str, str] | None = None)
     try:
         time.sleep(1.2)
         script = """
-const ws = new WebSocket('ws://127.0.0.1:8896');
+const ws = new WebSocket('ws://127.0.0.1:__PORT__');
 ws.onopen = () => ws.send(JSON.stringify({jsonrpc:'2.0',id:'init',method:'initialize',params:{protocolVersion:'2025-06-18',clientInfo:{name:'check',version:'0'},capabilities:{}}}));
 ws.onmessage = (event) => {
   const msg = JSON.parse(String(event.data));
@@ -184,7 +280,7 @@ ws.onmessage = (event) => {
 };
 ws.onerror = (err) => { console.error(err.message || err); process.exit(1); };
 setTimeout(() => process.exit(2), 10000);
-"""
+""".replace("__PORT__", str(port))
         result = subprocess.run(
             ["node", "-e", script],
             check=False,
@@ -194,6 +290,85 @@ setTimeout(() => process.exit(2), 10000);
         )
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "model/list failed")
+        return json.loads(result.stdout.strip())
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            server.kill()
+
+
+def runtime_plugin_summary(codex_home: Path, extra_env: dict[str, str] | None = None) -> dict:
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(codex_home)
+    if extra_env:
+        env.update(extra_env)
+
+    port = pick_free_port()
+    server = subprocess.Popen(
+        [str(CODEX_CLI), "app-server", "--listen", f"ws://127.0.0.1:{port}"],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        time.sleep(1.2)
+        script = """
+const ws = new WebSocket('ws://127.0.0.1:__PORT__');
+const pending = new Map();
+const results = {};
+let nextId = 1;
+function send(method, params = {}) {
+  const id = String(nextId++);
+  pending.set(id, method);
+  ws.send(JSON.stringify({jsonrpc:'2.0', id, method, params}));
+}
+ws.onopen = () => send('initialize', {protocolVersion:'2025-06-18', clientInfo:{name:'check', version:'0'}, capabilities:{}});
+ws.onmessage = (event) => {
+  const msg = JSON.parse(String(event.data));
+  const method = pending.get(String(msg.id));
+  if (!method) return;
+  pending.delete(String(msg.id));
+  if (method === 'initialize') {
+    ws.send(JSON.stringify({jsonrpc:'2.0', method:'notifications/initialized', params:{}}));
+    send('plugin/list');
+    send('mcpServerStatus/list');
+    return;
+  }
+  if (msg.error) {
+    console.error(JSON.stringify(msg.error));
+    process.exit(1);
+  }
+  results[method] = msg.result || {};
+  if (results['plugin/list'] && results['mcpServerStatus/list']) {
+    const plugins = [];
+    for (const marketplace of results['plugin/list'].marketplaces || []) {
+      for (const plugin of marketplace.plugins || []) {
+        if (plugin.installed || plugin.enabled) plugins.push(plugin.id);
+      }
+    }
+    const statuses = results['mcpServerStatus/list'].servers || results['mcpServerStatus/list'].data || [];
+    const mcpServers = statuses.map((server) => ({
+      name: server.name,
+      toolCount: Object.keys(server.tools || {}).length,
+    }));
+    console.log(JSON.stringify({plugins: plugins.sort(), mcpServers}));
+    process.exit(0);
+  }
+};
+ws.onerror = (err) => { console.error(err.message || err); process.exit(1); };
+setTimeout(() => process.exit(2), 15000);
+""".replace("__PORT__", str(port))
+        result = subprocess.run(
+            ["node", "-e", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "plugin check failed")
         return json.loads(result.stdout.strip())
     finally:
         server.terminate()
@@ -253,6 +428,12 @@ def main() -> int:
             reporter.ok(f"cloned app signature valid: {CLONED_APP}")
         else:
             reporter.fail(f"cloned app signature invalid: {CLONED_APP}")
+
+        gate_ok, gate_issues = cloned_app_plugin_gate_summary(CLONED_APP)
+        if gate_ok:
+            reporter.ok("cloned app bypasses thirdparty desktop gates")
+        else:
+            reporter.fail("; ".join(gate_issues))
     else:
         reporter.warn(
             f"cloned app not created yet: {CLONED_APP} (run codex-app-3p once to build it)"
@@ -300,7 +481,9 @@ def main() -> int:
         reporter.warn(f"openai app-home catalog missing: {openai_catalog}")
 
     thirdparty_config = BASE_CODEX_HOME / "app-homes" / "thirdparty" / "config.toml"
+    thirdparty_enabled_plugin_ids: list[str] = []
     if thirdparty_config.exists():
+        thirdparty_data = load_toml(thirdparty_config)
         provider = top_level_provider(thirdparty_config)
         if provider == "thirdparty":
             reporter.ok("thirdparty app-home provider is thirdparty")
@@ -313,20 +496,66 @@ def main() -> int:
             reporter.fail("thirdparty app-home still forces service_tier")
         else:
             reporter.ok("thirdparty app-home does not force service_tier")
+
+        plugin_marketplaces = thirdparty_data.get("marketplaces", {})
+        thirdparty_enabled_plugin_ids = enabled_plugin_ids(thirdparty_data)
+        cached_marketplaces = {
+            name
+            for name in ("openai-curated", "openai-bundled", "openai-primary-runtime")
+            if isinstance(plugin_marketplaces.get(name), dict)
+            and plugin_marketplaces[name].get("source_type") == "local"
+            and Path(str(plugin_marketplaces[name].get("source", ""))).exists()
+        }
+        required_local_marketplaces = sorted(
+            {
+                plugin_id.rsplit("@", 1)[-1]
+                for plugin_id in thirdparty_enabled_plugin_ids
+                if "@" in plugin_id
+                and plugin_id.rsplit("@", 1)[-1]
+                in {"openai-curated", "openai-primary-runtime"}
+            }
+        )
+        missing_local_marketplaces = [
+            name for name in required_local_marketplaces if name not in cached_marketplaces
+        ]
+        if missing_local_marketplaces:
+            reporter.fail(
+                "thirdparty app-home is missing local plugin marketplace(s): "
+                + ", ".join(missing_local_marketplaces)
+            )
+        elif cached_marketplaces:
+            reporter.ok(
+                "thirdparty app-home uses local plugin marketplace(s): "
+                + ", ".join(sorted(cached_marketplaces))
+            )
+        else:
+            reporter.warn("thirdparty app-home has no cached curated/runtime plugin marketplace")
     else:
         reporter.warn(f"thirdparty app-home config missing: {thirdparty_config}")
 
+    thirdparty_plugins = BASE_CODEX_HOME / "app-homes" / "thirdparty" / "plugins"
+    expected_plugins_target = BASE_CODEX_HOME / "plugins"
+    if thirdparty_plugins.is_symlink() and thirdparty_plugins.resolve() == expected_plugins_target.resolve():
+        reporter.ok("thirdparty app-home shares the global plugin cache")
+    else:
+        reporter.fail(f"thirdparty app-home plugin cache is not shared: {thirdparty_plugins}")
+
     thirdparty_catalog = BASE_CODEX_HOME / "app-homes" / "thirdparty" / "model-catalogs" / "thirdparty.json"
+    thirdparty_catalog_slugs: list[str] = []
     if thirdparty_catalog.exists():
         catalog_entries = model_catalog_entries(thirdparty_catalog)
-        spark_entry = next(
-            (entry for entry in catalog_entries if entry.get("slug") == "gpt-5.3-codex-spark"),
-            None,
-        )
-        if spark_entry is None:
-            reporter.fail("thirdparty catalog is missing gpt-5.3-codex-spark")
+        thirdparty_catalog_slugs = [
+            str(entry.get("slug"))
+            for entry in catalog_entries
+            if isinstance(entry.get("slug"), str)
+        ]
+        if thirdparty_catalog_slugs:
+            reporter.ok(
+                "thirdparty catalog is populated: "
+                + ", ".join(thirdparty_catalog_slugs)
+            )
         else:
-            reporter.ok("thirdparty catalog contains gpt-5.3-codex-spark")
+            reporter.fail(f"thirdparty catalog is empty: {thirdparty_catalog}")
 
         forced_fast_models = [
             str(entry.get("slug"))
@@ -345,7 +574,7 @@ def main() -> int:
         if any(entry.get("slug") == "gpt-5.4-mini" for entry in catalog_entries):
             reporter.ok("thirdparty catalog contains gpt-5.4-mini")
         else:
-            reporter.fail("thirdparty catalog is missing gpt-5.4-mini")
+            reporter.warn("thirdparty catalog does not include gpt-5.4-mini")
     else:
         reporter.warn(f"thirdparty catalog missing: {thirdparty_catalog}")
 
@@ -414,20 +643,58 @@ def main() -> int:
         except Exception as exc:
             reporter.fail(f"thirdparty runtime model/list failed: {exc}")
         else:
-            expected_thirdparty_models = [
-                "gpt-5.4",
-                "gpt-5.4-mini",
-                "gpt-5.3-codex",
-                "gpt-5.3-codex-spark",
-                "gpt-5.2",
-            ]
-            if thirdparty_runtime_models == expected_thirdparty_models:
-                reporter.ok("thirdparty runtime model/list includes gpt-5.4-mini and spark")
+            if thirdparty_catalog_slugs and thirdparty_runtime_models == thirdparty_catalog_slugs:
+                reporter.ok("thirdparty runtime model/list matches the thirdparty catalog")
             else:
                 reporter.fail(
                     "thirdparty runtime model/list mismatch: "
-                    + ", ".join(thirdparty_runtime_models or ["<empty>"])
+                    f"runtime={thirdparty_runtime_models or ['<empty>']} "
+                    f"catalog={thirdparty_catalog_slugs or ['<empty>']}"
                 )
+
+        try:
+            plugin_summary = runtime_plugin_summary(
+                BASE_CODEX_HOME / "app-homes" / "thirdparty",
+                {"CODEX_CLI_PATH": str(HOME / ".local" / "bin" / "codex-3p")},
+            )
+        except Exception as exc:
+            reporter.fail(f"thirdparty runtime plugin check failed: {exc}")
+        else:
+            runtime_plugins = plugin_summary.get("plugins") or []
+            missing_plugins = [
+                plugin_id
+                for plugin_id in thirdparty_enabled_plugin_ids
+                if plugin_id not in runtime_plugins
+            ]
+            if missing_plugins:
+                reporter.fail("thirdparty runtime plugins missing: " + ", ".join(missing_plugins))
+            elif thirdparty_enabled_plugin_ids:
+                reporter.ok("thirdparty runtime lists enabled plugins")
+            else:
+                reporter.warn("thirdparty app-home has no enabled plugins to validate")
+
+            mcp_servers = {
+                item.get("name"): int(item.get("toolCount") or 0)
+                for item in plugin_summary.get("mcpServers") or []
+                if isinstance(item, dict)
+            }
+            expected_mcp_servers = []
+            if "computer-use@openai-bundled" in thirdparty_enabled_plugin_ids:
+                expected_mcp_servers.append("computer-use")
+            missing_mcp_servers = [
+                name
+                for name in expected_mcp_servers
+                if mcp_servers.get(name, 0) <= 0
+            ]
+            if missing_mcp_servers:
+                reporter.fail(
+                    "thirdparty runtime plugin tools missing for: "
+                    + ", ".join(missing_mcp_servers)
+                )
+            elif expected_mcp_servers:
+                reporter.ok("thirdparty runtime exposes plugin MCP tools")
+            else:
+                reporter.warn("thirdparty app-home has no enabled MCP-backed plugins to validate")
 
     global_config = BASE_CODEX_HOME / "config.toml"
     if global_config.exists():
